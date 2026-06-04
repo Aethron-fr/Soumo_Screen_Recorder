@@ -39,6 +39,23 @@ from utils.animations   import (
     Animator, ColorAnimator, PulseLoop,
     ease_out_cubic, ease_in_out_sine, lerp_color, lerp
 )
+import tkinter.font as _tkfont
+
+
+def _safe_font(preferred: str = "Segoe UI Variable",
+               fallback: str = "Segoe UI",
+               size: int = 10,
+               weight: str = "normal") -> tuple:
+    """
+    Return a font tuple using `preferred` if it exists on this system,
+    otherwise `fallback`. Safe on Python 3.14 and older Windows.
+    """
+    try:
+        available = _tkfont.families()
+        family = preferred if preferred in available else fallback
+    except Exception:
+        family = fallback
+    return (family, size, weight)
 
 log = logging.getLogger(__name__)
 
@@ -347,7 +364,8 @@ class PillSelector:
         on_change:  Callback(new_idx: int) when selection changes.
     """
     PILL_H   = 20
-    FONT     = ("Segoe UI Variable", 9, "bold")
+    # Font resolved at class definition time — safe fallback if Segoe UI Variable missing
+    FONT     = _safe_font("Segoe UI Variable", "Segoe UI", 9, "bold")
     OPT_PAD  = 9    # horizontal padding per option
     GAP      = 2    # gap between option pills
     LABEL_W  = 24   # space reserved for label
@@ -680,12 +698,11 @@ class Toolbar(tk.Tk):
         cvs.create_oval(x, cy-4, x+8, cy+4, fill=RED, outline="", tags="dot")
         x += 14
 
-        # Brand text
+        # Brand text  (spacing1 is Text-widget only — invalid on canvas items)
         cvs.create_text(x, cy, text="SOUMO",
                         fill="#5A5A8A",
-                        font=("Segoe UI Variable", 10, "bold"),
-                        anchor="w", tags="brand",
-                        spacing1=4)
+                        font=_safe_font("Segoe UI Variable", "Segoe UI", 10, "bold"),
+                        anchor="w", tags="brand")
         cvs.tag_bind("brand", "<ButtonPress-1>",  self._drag_start)
         cvs.tag_bind("brand", "<B1-Motion>",      self._drag_move)
         x += 62
