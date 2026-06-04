@@ -1,300 +1,316 @@
 """
 ui/toast.py
-Premium stacking toast notification system.
+Premium stacking toast notification system — rebuilt from scratch.
 
-Features:
-  - Slides up from bottom-right corner
-  - Color-coded left border (green/blue/red)
-  - Action buttons: Open file + Open folder
-  - Auto-dismiss after configurable duration
+Design:
+  - Slides up from bottom-right
+  - Color-coded 3px left border
+  - Open + Folder action buttons when file_path given
   - Stacks multiple toasts with 8px gap
-  - Invisible to screen capture (WDA_EXCLUDEFROMCAPTURE)
-  - Thread-safe: safe to call notify() from any thread
+  - Auto-dismiss after 4 seconds
+  - WDA_EXCLUDEFROMCAPTURE — invisible in recordings
+  - Thread-safe: call ToastManager.show() from any thread
 """
 from __future__ import annotations
 import tkinter as tk
 import ctypes
 import os
-import logging
 import threading
-from typing import Optional
+import logging
+from typing import Optional, List, Callable
 
-from utils.animations import Animator, ease_out_cubic
+from utils.animations import Animator, interpolate_color
 
 log = logging.getLogger(__name__)
 
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
-# ── Palette ────────────────────────────────────────────────────────────────────
-BG        = "#13131E"
-TEXT_P    = "#F0F0F5"
-TEXT_S    = "#9999BB"
-BTN_BG    = "#1E1E2E"
-BTN_HOVER = "#2A2A3E"
+# ── Design tokens ─────────────────────────────────────────────────────────────
+BG      = "#0F0F18"
+SURFACE = "#16161F"
+BORDER  = "#1E1E2E"
+TP      = "#E8E8F0"
+TS      = "#6B6B8A"
+TD      = "#3A3A55"
 
-BORDER_SUCCESS = "#27AE60"
-BORDER_INFO    = "#3498DB"
-BORDER_ERROR   = "#E74C3C"
-BORDER_WARNING = "#F39C12"
+KIND_COLORS = {
+    "success": "#3DDC84",
+    "error":   "#E5383B",
+    "info":    "#4A9EFF",
+    "warning": "#FFB800",
+}
+KIND_ICONS = {
+    "success": "✓",
+    "error":   "✕",
+    "info":    "i",
+    "warning": "!",
+}
 
-# ── State ──────────────────────────────────────────────────────────────────────
-_lock    = threading.Lock()
-_toasts: list["_Toast"] = []
-_root_ref = None         # set by first toast; reused for scheduling
+TOAST_W = 300
+TOAST_MARGIN = 16
+TOAST_GAP    = 8
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Toast Manager
+# ══════════════════════════════════════════════════════════════════════════════
 
-def notify(
-    title:     str,
-    message:   str = "",
-    kind:      str = "info",
-    file_path: Optional[str] = None,
-    duration:  int  = 4000,
-) -> None:
+class ToastManager:
     """
-    Show a toast notification.
+    Manages a stack of Toast notifications.
 
-    Thread-safe. Can be called from any thread.
+    Thread-safe. Call show() from any thread.
 
     Args:
-        title:     Bold title line.
-        message:   Secondary message line.
-        kind:      "success" | "info" | "error" | "warning"
-        file_path: If set, shows Open + Folder action buttons.
-        duration:  Milliseconds before auto-dismiss. 0 = no auto-dismiss.
+        root: Tkinter root window (used for .after() scheduling).
     """
-    def _create():
-        _Toast(title=title, message=message, kind=kind,
-               file_path=file_path, duration=duration)
 
-    # If called from non-main thread, schedule on main thread
-    if _root_ref and _root_ref.winfo_exists():
-        _root_ref.after(0, _create)
-    else:
-        # First toast — create directly (must be on main thread)
-        _create()
+    def __init__(self, root: tk.Tk):
+        self.root   = root
+        self._stack: List[Toast] = []
+        self._lock  = threading.Lock()
 
+    def show(
+        self,
+        title:     str,
+        subtitle:  str = "",
+        kind:      str = "info",
+        file_path: Optional[str] = None,
+        duration:  int = 4000,
+    ) -> None:
+        """
+        Show a toast notification. Safe to call from any thread.
 
-def _get_border_color(kind: str) -> str:
-    return {
-        "success": BORDER_SUCCESS,
-        "info":    BORDER_INFO,
-        "error":   BORDER_ERROR,
-        "warning": BORDER_WARNING,
-    }.get(kind, BORDER_INFO)
+        Args:
+            title:     Bold title line.
+            subtitle:  Secondary smaller line.
+            kind:      "success" | "error" | "info" | "warning"
+            file_path: If given, shows Open + Folder buttons.
+            duration:  Auto-dismiss delay in ms. 0 = no auto-dismiss.
+        """
+        self.root.after(0, lambda: self._create(title, subtitle, kind, file_path, duration))
 
+    def _create(self, title, subtitle, kind, file_path, duration):
+        toast = Toast(
+            root=self.root,
+            title=title,
+            subtitle=subtitle,
+            kind=kind,
+            file_path=file_path,
+            duration=duration,
+            on_remove=self._remove,
+        )
+        with self._lock:
+            self._stack.append(toast)
+        self._restack()
+        toast.appear()
 
-def _get_icon(kind: str) -> str:
-    return {
-        "success": "✓",
-        "info":    "ℹ",
-        "error":   "✕",
-        "warning": "⚠",
-    }.get(kind, "ℹ")
+    def _remove(self, toast: "Toast"):
+        with self._lock:
+            if toast in self._stack:
+                self._stack.remove(toast)
+        self._restack()
 
-
-def _reposition_all() -> None:
-    """Recalculate vertical positions for all visible toasts."""
-    margin_r = 16
-    margin_b = 16
-    gap      = 8
-
-    try:
-        sw = _root_ref.winfo_screenwidth()
-        sh = _root_ref.winfo_screenheight()
-    except Exception:
-        return
-
-    y_cursor = sh - margin_b
-    for toast in reversed(_toasts):
-        if not toast._dismissed:
-            h = toast._win.winfo_height() or toast.ESTIMATED_H
+    def _restack(self):
+        """Recalculate target Y for all visible toasts."""
+        sh = self.root.winfo_screenheight()
+        y_cursor = sh - TOAST_MARGIN
+        with self._lock:
+            stack = list(reversed(self._stack))
+        for toast in stack:
+            h = toast.height
             y_cursor -= h
-            target_x = sw - toast.W - margin_r
-            target_y = y_cursor
-            toast._set_target_pos(target_x, target_y)
-            y_cursor -= gap
+            toast.move_to(sh - TOAST_W - TOAST_MARGIN, y_cursor)
+            y_cursor -= TOAST_GAP
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Toast
+# ══════════════════════════════════════════════════════════════════════════════
 
-class _Toast:
-    W           = 300
-    ESTIMATED_H = 80
+class Toast:
+    """A single toast notification window."""
 
-    def __init__(self, title: str, message: str, kind: str,
-                 file_path: Optional[str], duration: int):
-        global _root_ref
-
-        self._file_path = file_path
+    def __init__(
+        self,
+        root:       tk.Tk,
+        title:      str,
+        subtitle:   str,
+        kind:       str,
+        file_path:  Optional[str],
+        duration:   int,
+        on_remove:  Callable,
+    ):
+        self.root      = root
+        self.file_path = file_path
+        self._on_remove = on_remove
         self._dismissed = False
-        self._target_x  = 0
-        self._target_y  = 0
+        self.kind_color = KIND_COLORS.get(kind, KIND_COLORS["info"])
 
-        border_color = _get_border_color(kind)
-        icon         = _get_icon(kind)
+        # Estimate height before building
+        has_sub   = bool(subtitle)
+        has_btns  = bool(file_path and os.path.exists(file_path))
+        self.height = 56 + (16 if has_sub else 0) + (32 if has_btns else 0)
 
+        sh = root.winfo_screenheight()
+        self._x = sh - TOAST_W - TOAST_MARGIN  # will be corrected in move_to
+        self._y = sh + self.height              # starts off-screen
+
+        self._win = tk.Toplevel(root)
+        self._win.overrideredirect(True)
+        self._win.attributes("-topmost", True)
+        self._win.attributes("-alpha", 0.0)
+        self._win.geometry(f"{TOAST_W}x{self.height}+{self._x}+{self._y}")
+        self._win.configure(bg=BG)
+
+        self._exclude_from_capture()
+        self._build(title, subtitle, kind, has_btns)
+        self.animator = Animator(root)
+
+        if duration > 0:
+            root.after(duration, self.dismiss)
+
+    def _exclude_from_capture(self):
         try:
-            # Create Toplevel (needs a root)
-            if _root_ref is None or not _root_ref.winfo_exists():
-                # Create a hidden root
-                _root_ref = tk.Tk()
-                _root_ref.withdraw()
+            hwnd = ctypes.windll.user32.GetParent(self._win.winfo_id())
+            ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+        except Exception:
+            pass
 
-            self._win = tk.Toplevel(_root_ref)
-            self._win.overrideredirect(True)
-            self._win.attributes("-topmost", True)
-            self._win.attributes("-alpha", 0.0)
-            self._win.configure(bg=BG)
+    def _build(self, title: str, subtitle: str, kind: str, has_btns: bool):
+        W = TOAST_W
+        color = self.kind_color
 
-            # Exclude from screen capture
-            try:
-                hwnd = ctypes.windll.user32.GetParent(self._win.winfo_id())
-                ctypes.windll.user32.SetWindowDisplayAffinity(
-                    hwnd, WDA_EXCLUDEFROMCAPTURE)
-            except Exception:
-                pass
+        # Left accent border
+        border_frame = tk.Frame(self._win, bg=color, width=3)
+        border_frame.pack(side="left", fill="y")
 
-            # ── Layout ────────────────────────────────────────────────────────
-            outer = tk.Frame(self._win, bg=BG, bd=0)
-            outer.pack(fill="both", expand=True)
+        # Content
+        content = tk.Frame(self._win, bg=BG)
+        content.pack(side="left", fill="both", expand=True, padx=(10, 12), pady=10)
 
-            # Left color border
-            tk.Frame(outer, bg=border_color, width=4).pack(side="left", fill="y")
+        # Header row
+        hdr = tk.Frame(content, bg=BG)
+        hdr.pack(fill="x")
 
-            # Content area
-            content = tk.Frame(outer, bg=BG, padx=12, pady=10)
-            content.pack(side="left", fill="both", expand=True)
+        icon_lbl = tk.Label(hdr, text=KIND_ICONS.get(kind, "i"),
+                             bg=BG, fg=color,
+                             font=("Segoe UI", 10, "bold"))
+        icon_lbl.pack(side="left")
 
-            # Title row
-            title_row = tk.Frame(content, bg=BG)
-            title_row.pack(fill="x")
-            tk.Label(title_row, text=icon,
-                     bg=BG, fg=border_color,
-                     font=("Segoe UI Variable", 12, "bold")).pack(side="left")
-            tk.Label(title_row, text=f"  {title}",
-                     bg=BG, fg=TEXT_P,
-                     font=("Segoe UI Variable", 11, "bold")).pack(side="left")
+        tk.Label(hdr, text=f"  {title}",
+                 bg=BG, fg=TP,
+                 font=("Segoe UI", 10, "bold")).pack(side="left")
 
-            # Message
-            if message:
-                msg_lbl = tk.Label(content, text=message,
-                                   bg=BG, fg=TEXT_S,
-                                   font=("Segoe UI", 9),
-                                   wraplength=self.W - 40,
-                                   anchor="w", justify="left")
-                msg_lbl.pack(fill="x", pady=(2, 0))
+        # Dismiss X
+        x_lbl = tk.Label(hdr, text="✕", bg=BG, fg=TD,
+                          font=("Segoe UI", 9), cursor="hand2")
+        x_lbl.pack(side="right")
+        x_lbl.bind("<Enter>", lambda _: x_lbl.configure(fg="#E5383B"))
+        x_lbl.bind("<Leave>", lambda _: x_lbl.configure(fg=TD))
+        x_lbl.bind("<Button-1>", lambda _: self.dismiss())
 
-            # Action buttons (Open + Folder) if file_path is given
-            if file_path and os.path.exists(file_path):
-                btn_row = tk.Frame(content, bg=BG)
-                btn_row.pack(fill="x", pady=(6, 0))
-                self._make_action_btn(btn_row, "Open",   lambda: self._open_file())
-                self._make_action_btn(btn_row, "Folder", lambda: self._open_folder())
+        # Subtitle
+        if subtitle:
+            tk.Label(content, text=subtitle, bg=BG, fg=TS,
+                     font=("Segoe UI", 9),
+                     wraplength=TOAST_W - 40,
+                     anchor="w", justify="left").pack(fill="x", pady=(2, 0))
 
-            self._win.update_idletasks()
+        # Action buttons
+        if has_btns:
+            btn_row = tk.Frame(content, bg=BG)
+            btn_row.pack(fill="x", pady=(8, 0))
+            self._make_btn(btn_row, "Open",
+                           lambda: os.startfile(self.file_path))
+            self._make_btn(btn_row, "Folder",
+                           lambda: os.startfile(os.path.dirname(self.file_path)))
 
-            # ── Initial position (off-screen bottom-right) ─────────────────
-            with _lock:
-                _toasts.append(self)
-            _reposition_all()
+        # Outer border
+        self._win.configure(highlightbackground=BORDER,
+                             highlightthickness=1,
+                             highlightcolor=BORDER)
 
-            sw = _root_ref.winfo_screenwidth()
-            sh = _root_ref.winfo_screenheight()
-            start_y = sh + 20
-
-            self._win.geometry(
-                f"{self.W}x{self._win.winfo_reqheight()}+{self._target_x}+{start_y}")
-            self._win.deiconify()
-
-            # ── Slide up + fade in ─────────────────────────────────────────
-            end_x = self._target_x
-            end_y = self._target_y
-
-            def _in(t):
-                yy = int(start_y + (end_y - start_y) * ease_out_cubic(t))
-                try:
-                    self._win.geometry(f"+{end_x}+{yy}")
-                    self._win.attributes("-alpha", min(t * 1.5, 0.96))
-                except Exception:
-                    pass
-
-            Animator(self._win, 320, _in).start()
-
-            # ── Auto-dismiss ───────────────────────────────────────────────
-            if duration > 0:
-                self._win.after(duration, self.dismiss)
-
-        except Exception as e:
-            log.exception("Toast creation error: %s", e)
-
-    def _make_action_btn(self, parent: tk.Frame, text: str,
-                         command) -> tk.Label:
-        btn = tk.Label(parent, text=text,
-                       bg=BTN_BG, fg=TEXT_P,
-                       font=("Segoe UI", 9),
-                       padx=10, pady=3, cursor="hand2",
-                       relief="flat")
+    def _make_btn(self, parent: tk.Frame, text: str, cmd: Callable) -> tk.Label:
+        btn = tk.Label(parent, text=text, bg=SURFACE, fg=TP,
+                       font=("Segoe UI", 8), padx=10, pady=3, cursor="hand2")
         btn.pack(side="left", padx=(0, 6))
-        btn.bind("<Enter>", lambda _: btn.configure(bg=BTN_HOVER))
-        btn.bind("<Leave>", lambda _: btn.configure(bg=BTN_BG))
-        btn.bind("<Button-1>", lambda _: command())
+        btn.bind("<Enter>", lambda _: btn.configure(bg="#20202E"))
+        btn.bind("<Leave>", lambda _: btn.configure(bg=SURFACE))
+        btn.bind("<Button-1>", lambda _: cmd())
         return btn
 
-    def _set_target_pos(self, x: int, y: int) -> None:
-        self._target_x = x
-        self._target_y = y
-        if not self._dismissed:
-            try:
-                self._win.geometry(f"+{x}+{y}")
-            except Exception:
-                pass
+    def appear(self):
+        """Slide up from below screen edge."""
+        sh  = self.root.winfo_screenheight()
+        tx  = self._x
+        ty  = self._y
+        end_y = ty  # _y is already the target, set by move_to before appear()
 
-    def _open_file(self):
-        if self._file_path and os.path.exists(self._file_path):
-            os.startfile(self._file_path)
+        start_y = sh + self.height + 10
 
-    def _open_folder(self):
-        if self._file_path:
-            folder = os.path.dirname(self._file_path)
-            if os.path.exists(folder):
-                os.startfile(folder)
+        self.animator.animate(
+            f"toast_{id(self)}_in",
+            start=float(start_y), end=float(end_y),
+            duration_ms=320, easing="ease_out_cubic",
+            on_update=lambda y: self._set_pos(tx, int(y)),
+        )
+        self.animator.animate(
+            f"toast_{id(self)}_fade_in",
+            start=0.0, end=0.97,
+            duration_ms=200, easing="ease_out_cubic",
+            on_update=lambda a: self._set_alpha(a),
+        )
 
-    def dismiss(self) -> None:
-        """Slide down and fade out, then destroy."""
+    def dismiss(self):
+        """Slide down off screen and destroy."""
         if self._dismissed:
             return
         self._dismissed = True
+        self._on_remove(self)
 
-        with _lock:
-            if self in _toasts:
-                _toasts.remove(self)
-        _reposition_all()
+        sh    = self.root.winfo_screenheight()
+        cur_y = self._y
+        end_y = sh + self.height + 10
 
-        start_x = self._target_x
-        start_y = self._target_y
-        end_y   = start_y + 60
+        self.animator.animate(
+            f"toast_{id(self)}_out",
+            start=float(cur_y), end=float(end_y),
+            duration_ms=260, easing="ease_in_out_sine",
+            on_update=lambda y: self._set_pos(self._x, int(y)),
+            on_done=self._destroy,
+        )
+        self.animator.animate(
+            f"toast_{id(self)}_fade_out",
+            start=0.97, end=0.0,
+            duration_ms=220, easing="ease_in_out_sine",
+            on_update=lambda a: self._set_alpha(a),
+        )
 
-        def _out(t):
-            yy = int(start_y + (end_y - start_y) * t)
+    def move_to(self, x: int, y: int):
+        """Update target position (called by manager during restack)."""
+        self._x = x
+        self._y = y
+        if not self._dismissed:
             try:
-                self._win.geometry(f"+{start_x}+{yy}")
-                self._win.attributes("-alpha", 0.96 * (1 - t))
+                self._win.geometry(f"{TOAST_W}x{self.height}+{x}+{y}")
             except Exception:
                 pass
 
-        def _done():
-            try:
-                self._win.destroy()
-            except Exception:
-                pass
-
+    def _set_pos(self, x: int, y: int):
         try:
-            Animator(self._win, 260, _out, on_complete=_done,
-                     easing=ease_out_cubic).start()
+            self._win.geometry(f"{TOAST_W}x{self.height}+{x}+{y}")
         except Exception:
-            try:
-                self._win.destroy()
-            except Exception:
-                pass
+            pass
+
+    def _set_alpha(self, a: float):
+        try:
+            self._win.attributes("-alpha", max(0.0, min(1.0, a)))
+        except Exception:
+            pass
+
+    def _destroy(self):
+        try:
+            self._win.destroy()
+        except Exception:
+            pass

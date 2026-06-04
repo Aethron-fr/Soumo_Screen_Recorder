@@ -1,513 +1,205 @@
 """
 ui/toolbar.py
 Soumo Screen Recorder PRO — Premium Floating Toolbar.
+Rebuilt from scratch. No legacy code. No compromises.
 
-A pill-shaped, frameless, always-on-top Canvas window.
-Every element drawn directly on Canvas for pixel-perfect control.
-Uses the Windows transparent-color trick for true pill shape.
-
-Features:
-  - True pill shape via transparentcolor window attribute
-  - Canvas-drawn icons (no emoji — vector-style lines/arcs)
-  - Inline FPS + Quality pill selectors with slide animation
-  - Smooth hover/press/release animations (spring physics)
-  - Record pulse, digit crossfade, screen flash
-  - Thread-safe via root.after(0, ...)
-  - Capture exclusion (WDA_EXCLUDEFROMCAPTURE)
+Architecture:
+  - Single tk.Canvas covers the entire window — no widget children
+  - True pill shape via Windows transparentcolor key (_HOLE)
+  - Every button, label and selector is a canvas item group
+  - New key-based Animator drives all motion (hover, press, pulse)
+  - No emoji used as icons — all icons built from canvas lines/arcs
+  - WDA_EXCLUDEFROMCAPTURE: toolbar is invisible in all recordings
 """
 from __future__ import annotations
 import tkinter as tk
 import ctypes
+import math
 import threading
-import time
+import datetime
 import os
 import sys
 import logging
-import datetime
-from typing import Optional, Tuple, List, Callable
+from typing import Optional, Tuple, Callable, Dict, Any
 
 from core.recorder      import ScreenRecorder
 from core.screenshot    import take_screenshot
 from ui.region_selector import RegionSelector
 from ui.settings_panel  import SettingsPanel
-from ui.toast           import notify
+from ui.toast           import ToastManager
 from ui.countdown       import CountdownOverlay
-from utils.state        import AppState
-from utils.settings     import Settings, save_settings, load_settings
+from utils.settings     import Settings, load_settings, save_settings
 from utils.hotkeys      import HotkeyManager
-from utils.animations   import (
-    Animator, ColorAnimator, PulseLoop,
-    ease_out_cubic, ease_in_out_sine, lerp_color, lerp
-)
-import tkinter.font as _tkfont
-
-
-def _safe_font(preferred: str = "Segoe UI Variable",
-               fallback: str = "Segoe UI",
-               size: int = 10,
-               weight: str = "normal") -> tuple:
-    """
-    Return a font tuple using `preferred` if it exists on this system,
-    otherwise `fallback`. Safe on Python 3.14 and older Windows.
-    """
-    try:
-        available = _tkfont.families()
-        family = preferred if preferred in available else fallback
-    except Exception:
-        family = fallback
-    return (family, size, weight)
+from utils.animations   import Animator, interpolate_color
 
 log = logging.getLogger(__name__)
 
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
+_HOLE = "#010203"  # transparentcolor key — never draw with this color
 
-# ── Palette ────────────────────────────────────────────────────────────────────
-_HOLE     = "#010203"   # transparent key — NEVER use this color elsewhere
-BG_MAIN   = "#0D0D14"
-BG_GRAD_T = "#111118"
-BG_GRAD_B = "#0A0A10"
-DIVIDER   = "#1A1A2A"
-HIGHLIGHT = "#1E1E2C"   # top rim 1px highlight
-TEXT_P    = "#F0F0F5"
-TEXT_S    = "#8888AA"
-TEXT_DIM  = "#444460"
-TEXT_VDM  = "#555570"
-BORDER    = "#1C1C28"
+# ── Design tokens (Vercel / Linear / Nothing OS inspired) ─────────────────────
+C = {
+    "bg_base":        "#080810",
+    "bg_surface":     "#0F0F18",
+    "bg_elevated":    "#16161F",
+    "bg_sunken":      "#06060D",
+    "border_subtle":  "#1E1E2E",
+    "border_dim":     "#2A2A3C",
+    "border_active":  "#3A3A52",
+    "text_primary":   "#E8E8F0",
+    "text_secondary": "#6B6B8A",
+    "text_dim":       "#3A3A55",
+    "red":            "#E5383B",
+    "red_dim":        "#2D0E0F",
+    "red_glow":       "#FF4444",
+    "blue":           "#4A9EFF",
+    "blue_dim":       "#0D1F35",
+    "green":          "#3DDC84",
+    "green_dim":      "#0D2B1A",
+    "amber":          "#FFB800",
+    "amber_dim":      "#2B2000",
+    "purple":         "#A78BFA",
+    "purple_dim":     "#1A1228",
+}
 
-# Button idle backgrounds
-BTN_SHOT_IDLE  = "#1A2030"
-BTN_REC_IDLE   = "#2A1515"
-BTN_PAUSE_IDLE = "#2A2010"
-BTN_REG_IDLE   = "#1A1A2A"
-BTN_FOLD_IDLE  = "#142014"
+F = {
+    "brand":    ("Segoe UI", 9, "bold"),
+    "label":    ("Segoe UI", 9, "normal"),
+    "timer":    ("Consolas", 13, "normal"),
+    "button":   ("Segoe UI", 8, "normal"),
+    "status":   ("Consolas", 11, "bold"),
+}
 
-# Button hover backgrounds
-BTN_SHOT_HOV   = "#1A5080"
-BTN_REC_HOV    = "#8B1A1A"
-BTN_PAUSE_HOV  = "#7A5510"
-BTN_REG_HOV    = "#3A2A6A"
-BTN_FOLD_HOV   = "#1A5A1A"
-
-# Accent colors
-RED    = "#C0392B"
-RED2   = "#E74C3C"
-BLUE   = "#3498DB"
-GREEN  = "#27AE60"
-AMBER  = "#F39C12"
-PURPLE = "#8B5CF6"
-
-# Bar geometry
-BAR_H  = 52
-BAR_W  = 860
-RADIUS = BAR_H // 2   # = 26 — full pill
+BAR_H = 48
+BAR_R = 24   # half of height — true pill
+BAR_W = 820  # calculated from layout below
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Drawing Utilities
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Canvas primitive helpers ──────────────────────────────────────────────────
 
-def _fill_pill(cvs: tk.Canvas, x1, y1, x2, y2, color: str, tags="") -> List[int]:
-    """Fill a pill (fully rounded rectangle) on canvas. Returns list of item IDs."""
-    r  = (y2 - y1) // 2
-    co = color
-    ids = [
-        cvs.create_oval(x1, y1, x1+2*r, y2, fill=co, outline=co, tags=tags),
-        cvs.create_oval(x2-2*r, y1, x2, y2, fill=co, outline=co, tags=tags),
-        cvs.create_rectangle(x1+r, y1, x2-r, y2, fill=co, outline=co, tags=tags),
-    ]
-    return ids
-
-
-def _outline_pill(cvs: tk.Canvas, x1, y1, x2, y2, color: str,
-                  width: int = 1, tags="") -> List[int]:
-    """Draw pill outline on canvas."""
+def _fill_pill(cvs, x1, y1, x2, y2, color, tags=""):
+    """Fill a pill (fully rounded rectangle where r = h/2)."""
     r = (y2 - y1) // 2
-    ids = [
-        cvs.create_arc(x1, y1, x1+2*r, y2, start=90, extent=180,
-                       style="arc", outline=color, width=width, tags=tags),
-        cvs.create_arc(x2-2*r, y1, x2, y2, start=270, extent=180,
-                       style="arc", outline=color, width=width, tags=tags),
-        cvs.create_line(x1+r, y1, x2-r, y1, fill=color, width=width, tags=tags),
-        cvs.create_line(x1+r, y2, x2-r, y2, fill=color, width=width, tags=tags),
-    ]
-    return ids
+    cvs.create_oval(x1, y1, x1+2*r, y2,        fill=color, outline=color, tags=tags)
+    cvs.create_oval(x2-2*r, y1, x2, y2,         fill=color, outline=color, tags=tags)
+    cvs.create_rectangle(x1+r, y1, x2-r, y2,   fill=color, outline=color, tags=tags)
 
 
-def _recolor_items(cvs: tk.Canvas, ids: List[int], color: str) -> None:
-    """Recolor a list of canvas items (fill + outline)."""
-    for iid in ids:
-        try:
-            cvs.itemconfigure(iid, fill=color, outline=color)
-        except Exception:
-            pass
+def _outline_pill(cvs, x1, y1, x2, y2, color, width=1, tags=""):
+    """Draw the outline of a pill shape."""
+    r = (y2 - y1) // 2
+    cvs.create_arc(x1, y1, x1+2*r, y2, start=90, extent=180,
+                   style="arc", outline=color, width=width, tags=tags)
+    cvs.create_arc(x2-2*r, y1, x2, y2, start=270, extent=180,
+                   style="arc", outline=color, width=width, tags=tags)
+    cvs.create_line(x1+r, y1,   x2-r, y1,   fill=color, width=width, tags=tags)
+    cvs.create_line(x1+r, y2-1, x2-r, y2-1, fill=color, width=width, tags=tags)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Canvas Icon Drawing
-# ══════════════════════════════════════════════════════════════════════════════
+def _fill_rrect(cvs, x1, y1, x2, y2, r, color, tags=""):
+    """Fill a rounded rectangle with arbitrary radius."""
+    r = min(r, (x2-x1)//2, (y2-y1)//2)
+    cvs.create_oval(x1,     y1,     x1+2*r, y1+2*r, fill=color, outline=color, tags=tags)
+    cvs.create_oval(x2-2*r, y1,     x2,     y1+2*r, fill=color, outline=color, tags=tags)
+    cvs.create_oval(x1,     y2-2*r, x1+2*r, y2,     fill=color, outline=color, tags=tags)
+    cvs.create_oval(x2-2*r, y2-2*r, x2,     y2,     fill=color, outline=color, tags=tags)
+    cvs.create_rectangle(x1+r, y1,   x2-r, y2,     fill=color, outline=color, tags=tags)
+    cvs.create_rectangle(x1,   y1+r, x2,   y2-r,   fill=color, outline=color, tags=tags)
 
-def draw_icon_camera(cvs: tk.Canvas, cx: int, cy: int, color: str, tags="") -> None:
-    """Camera icon — rounded body + lens circle + viewfinder bump."""
-    s = 9
-    hw, hh = s, int(s * 0.65)
-    r = 3
-    # Body
-    cvs.create_rectangle(cx-hw, cy-hh, cx+hw, cy+hh,
-                          outline=color, width=1.5, fill="", tags=tags)
-    # Viewfinder bump
-    cvs.create_rectangle(cx-4, cy-hh-3, cx+4, cy-hh,
-                          outline=color, width=1, fill="", tags=tags)
+
+# ── Icon functions ────────────────────────────────────────────────────────────
+# Rules:
+#   - Only create_line and create_arc(style='arc') for outlines
+#   - create_oval with fill=color for solid circles (record icon)
+#   - itemconfig(fill=c, outline=c) correctly updates ALL item types
+
+def _icon_camera(cvs, cx, cy, color, tags):
+    s = 7
+    # Body outline
+    cvs.create_line(cx-s, cy-s+2, cx+s, cy-s+2,
+                    cx+s, cy+s, cx-s, cy+s, cx-s, cy-s+2,
+                    fill=color, width=1.5, joinstyle="round", tags=tags)
     # Lens
-    lr = 4
-    cvs.create_oval(cx-lr, cy-lr, cx+lr, cy+lr,
-                    outline=color, width=1.5, fill="", tags=tags)
+    cvs.create_arc(cx-3, cy-1, cx+3, cy+5,
+                   start=0, extent=359, style="arc",
+                   outline=color, width=1.5, tags=tags)
+    # Viewfinder bump
+    cvs.create_line(cx-3, cy-s+2, cx-3, cy-s-2,
+                    cx+3, cy-s-2, cx+3, cy-s+2,
+                    fill=color, width=1, tags=tags)
 
 
-def draw_icon_record(cvs: tk.Canvas, cx: int, cy: int, color: str, tags="") -> None:
-    """Record icon — filled circle."""
-    r = 7
-    cvs.create_oval(cx-r, cy-r, cx+r, cy+r, fill=color, outline="", tags=tags)
+def _icon_record(cvs, cx, cy, color, tags):
+    r = 5
+    cvs.create_oval(cx-r, cy-r, cx+r, cy+r, fill=color, outline=color, tags=tags)
 
 
-def draw_icon_pause(cvs: tk.Canvas, cx: int, cy: int, color: str, tags="") -> None:
-    """Pause icon — two vertical bars."""
-    w, h = 4, 9
-    cvs.create_rectangle(cx-w-1, cy-h, cx-1, cy+h, fill=color, outline="", tags=tags)
-    cvs.create_rectangle(cx+1, cy-h, cx+w+1, cy+h, fill=color, outline="", tags=tags)
+def _icon_pause(cvs, cx, cy, color, tags):
+    bw, bh = 3, 10
+    cvs.create_rectangle(cx-5,    cy-bh//2, cx-5+bw, cy+bh//2,
+                         fill=color, outline=color, tags=tags)
+    cvs.create_rectangle(cx+2,    cy-bh//2, cx+2+bw, cy+bh//2,
+                         fill=color, outline=color, tags=tags)
 
 
-def draw_icon_region(cvs: tk.Canvas, cx: int, cy: int, color: str, tags="") -> None:
-    """Region icon — four corner bracket lines."""
-    s, arm = 9, 5
-    for (dx, dy) in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
-        ox, oy = cx + dx*s, cy + dy*s
+def _icon_region(cvs, cx, cy, color, tags):
+    s, arm = 7, 5
+    for dx, dy in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
+        ox, oy = cx + dx * s, cy + dy * s
         cvs.create_line(ox, oy, ox - dx*arm, oy,
-                        fill=color, width=1.5, tags=tags)
+                        fill=color, width=1.5, capstyle="round", tags=tags)
         cvs.create_line(ox, oy, ox, oy - dy*arm,
-                        fill=color, width=1.5, tags=tags)
+                        fill=color, width=1.5, capstyle="round", tags=tags)
 
 
-def draw_icon_folder(cvs: tk.Canvas, cx: int, cy: int, color: str, tags="") -> None:
-    """Folder icon — body rectangle + tab at top-left."""
-    hw, hh = 10, 7
-    cvs.create_rectangle(cx-hw, cy-hh+2, cx+hw, cy+hh,
-                          outline=color, width=1.5, fill="", tags=tags)
-    cvs.create_rectangle(cx-hw, cy-hh-1, cx-hw//2, cy-hh+4,
-                          outline=color, width=1.2, fill="", tags=tags)
+def _icon_folder(cvs, cx, cy, color, tags):
+    s = 7
+    # Body
+    cvs.create_line(cx-s, cy-s+3, cx+s, cy-s+3,
+                    cx+s, cy+s, cx-s, cy+s, cx-s, cy-s+3,
+                    fill=color, width=1.5, joinstyle="round", tags=tags)
+    # Tab
+    cvs.create_line(cx-s, cy-s+3, cx-s, cy-s-1,
+                    cx-s+7, cy-s-1, cx-s+7, cy-s+3,
+                    fill=color, width=1, tags=tags)
 
 
-def draw_icon_gear(cvs: tk.Canvas, cx: int, cy: int, color: str, tags="") -> None:
-    """Gear icon — circle + 6 tick marks around perimeter."""
-    import math
-    r_inner, r_outer = 4, 9
-    cvs.create_oval(cx-r_inner, cy-r_inner, cx+r_inner, cy+r_inner,
-                    outline=color, width=1.5, fill="", tags=tags)
+def _icon_settings(cvs, cx, cy, color, tags):
+    # Center circle
+    cvs.create_arc(cx-3, cy-3, cx+3, cy+3,
+                   start=0, extent=359, style="arc",
+                   outline=color, width=1.5, tags=tags)
+    # 6 tick marks
     for i in range(6):
-        angle = math.radians(i * 60)
-        x1 = cx + r_inner * math.cos(angle)
-        y1 = cy + r_inner * math.sin(angle)
-        x2 = cx + r_outer * math.cos(angle)
-        y2 = cy + r_outer * math.sin(angle)
-        cvs.create_line(x1, y1, x2, y2, fill=color, width=2.5, tags=tags,
-                        capstyle="round")
+        a  = math.radians(i * 60)
+        x1 = cx + math.cos(a) * 4.5
+        y1 = cy + math.sin(a) * 4.5
+        x2 = cx + math.cos(a) * 7.5
+        y2 = cy + math.sin(a) * 7.5
+        cvs.create_line(x1, y1, x2, y2,
+                        fill=color, width=2.2, capstyle="round", tags=tags)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Canvas Button
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Tooltip ───────────────────────────────────────────────────────────────────
 
-class CanvasButton:
-    """
-    A 36×36 circular button drawn entirely on Canvas.
-
-    Features smooth hover color animation (ColorAnimator),
-    press scale-down, and spring-physics release.
-
-    Args:
-        cvs:        The canvas to draw on.
-        cx, cy:     Center coordinates.
-        idle_bg:    Background color when idle.
-        hover_bg:   Background color when hovered.
-        icon_fn:    Function(cvs, cx, cy, color, tags) that draws the icon.
-        command:    Callable invoked on click.
-        tag:        Unique Canvas tag for this button.
-        radius:     Circle radius (default 18 = 36px diameter).
-    """
-    R          = 18
-    ICON_IDLE  = "#9999BB"
-    ICON_HOVER = "#FFFFFF"
-
-    def __init__(self, cvs: tk.Canvas, cx: int, cy: int,
-                 idle_bg: str, hover_bg: str,
-                 icon_fn: Callable, command: Callable = None,
-                 tag: str = "", radius: int = 18):
-        self.cvs      = cvs
-        self.cx       = cx
-        self.cy       = cy
-        self.r        = radius
-        self._idle    = idle_bg
-        self._hover   = hover_bg
-        self._icon_fn = icon_fn
-        self._cmd     = command
-        self._tag     = tag
-        self._cur_bg  = idle_bg
-        self._hovered = False
-        self._anim: Optional[ColorAnimator] = None
-        self._circle_id: Optional[int] = None
-        self._hidden  = False
-
-        self._draw_circle(idle_bg)
-        self._draw_icon(self.ICON_IDLE)
-
-        cvs.tag_bind(tag, "<Enter>",           self._on_enter)
-        cvs.tag_bind(tag, "<Leave>",           self._on_leave)
-        cvs.tag_bind(tag, "<ButtonPress-1>",   self._on_press)
-        cvs.tag_bind(tag, "<ButtonRelease-1>", self._on_release)
-
-    def _draw_circle(self, color: str, scale: float = 1.0) -> None:
-        if self._circle_id:
-            self.cvs.delete(self._circle_id)
-        r  = max(2, int(self.r * scale))
-        cx, cy = self.cx, self.cy
-        self._circle_id = self.cvs.create_oval(
-            cx-r, cy-r, cx+r, cy+r,
-            fill=color, outline="", tags=self._tag
-        )
-        self.cvs.tag_lower(self._circle_id)
-
-    def _draw_icon(self, color: str) -> None:
-        self.cvs.delete(f"{self._tag}_icon")
-        self._icon_fn(self.cvs, self.cx, self.cy, color, tags=f"{self._tag}_icon")
-        self.cvs.tag_bind(f"{self._tag}_icon", "<Enter>",           self._on_enter)
-        self.cvs.tag_bind(f"{self._tag}_icon", "<Leave>",           self._on_leave)
-        self.cvs.tag_bind(f"{self._tag}_icon", "<ButtonPress-1>",   self._on_press)
-        self.cvs.tag_bind(f"{self._tag}_icon", "<ButtonRelease-1>", self._on_release)
-
-    def _animate_bg(self, target: str) -> None:
-        if self._anim:
-            self._anim.stop()
-        self._anim = ColorAnimator(
-            self.cvs, self._cur_bg, target, 130,
-            setter=self._set_bg
-        ).start()
-
-    def _set_bg(self, color: str) -> None:
-        self._cur_bg = color
-        self._draw_circle(color)
-
-    def _on_enter(self, _=None) -> None:
-        if self._hidden:
-            return
-        self._hovered = True
-        self._animate_bg(self._hover)
-        self._draw_icon(self.ICON_HOVER)
-
-    def _on_leave(self, _=None) -> None:
-        if self._hidden:
-            return
-        self._hovered = False
-        self._animate_bg(self._idle)
-        self._draw_icon(self.ICON_IDLE)
-
-    def _on_press(self, _=None) -> None:
-        if self._hidden:
-            return
-        self._draw_circle(self._hover, scale=0.86)
-
-    def _on_release(self, _=None) -> None:
-        if self._hidden:
-            return
-        self._draw_circle(self._hover if self._hovered else self._idle, scale=1.0)
-        if self._cmd and not self._hidden:
-            self._cmd()
-
-    def set_icon_color(self, color: str) -> None:
-        """Override the icon draw color."""
-        self.ICON_IDLE  = color
-        self.ICON_HOVER = color
-        self._draw_icon(color)
-
-    def hide(self) -> None:
-        """Make the button invisible and non-interactive."""
-        self._hidden = True
-        self.cvs.delete(self._tag)
-        self.cvs.delete(f"{self._tag}_icon")
-        self._circle_id = None
-
-    def show(self) -> None:
-        """Make the button visible again."""
-        self._hidden = False
-        self._draw_circle(self._idle)
-        self._draw_icon(self.ICON_IDLE)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Pill Selector (Inline FPS / Quality)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class PillSelector:
-    """
-    Inline pill-button selector drawn on Canvas.
-
-    Displays a label + N option pills. The active option has a filled
-    pill background. Clicking a new option instantly redraws the selector
-    with the new active option highlighted.
-
-    Args:
-        cvs:        Canvas to draw on.
-        lx:         Left x position.
-        cy:         Center y position.
-        options:    List of option strings.
-        active_idx: Initially active index.
-        color:      Active pill fill color.
-        label:      Short label text (e.g. "FPS" or "Q").
-        on_change:  Callback(new_idx: int) when selection changes.
-    """
-    PILL_H   = 20
-    # Font resolved at class definition time — safe fallback if Segoe UI Variable missing
-    FONT     = _safe_font("Segoe UI Variable", "Segoe UI", 9, "bold")
-    OPT_PAD  = 9    # horizontal padding per option
-    GAP      = 2    # gap between option pills
-    LABEL_W  = 24   # space reserved for label
-
-    def __init__(self, cvs: tk.Canvas, lx: int, cy: int,
-                 options: List[str], active_idx: int,
-                 color: str, label: str, on_change: Callable = None):
-        self.cvs        = cvs
-        self.lx         = lx
-        self.cy         = cy
-        self.options    = options
-        self.active_idx = active_idx
-        self.color      = color
-        self.label      = label
-        self._on_change = on_change
-        self._all_ids: List[int] = []
-
-        # Calculate option widths
-        self._opt_w = [max(len(o) * 7 + self.OPT_PAD * 2, 28) for o in options]
-
-        self._draw()
-
-    def _opt_lx(self, idx: int) -> int:
-        """Left x of option at given index."""
-        x = self.lx + self.LABEL_W
-        for i in range(idx):
-            x += self._opt_w[i] + self.GAP
-        return x
-
-    @property
-    def total_width(self) -> int:
-        return self.LABEL_W + sum(self._opt_w) + self.GAP * (len(self.options) - 1)
-
-    def _draw(self) -> None:
-        """Full redraw of the selector."""
-        for iid in self._all_ids:
-            try:
-                self.cvs.delete(iid)
-            except Exception:
-                pass
-        self._all_ids.clear()
-
-        cy = self.cy
-        h  = self.PILL_H
-
-        # Label
-        lid = self.cvs.create_text(
-            self.lx, cy,
-            text=self.label,
-            fill=TEXT_VDM,
-            font=("Segoe UI", 9),
-            anchor="w"
-        )
-        self._all_ids.append(lid)
-
-        # Options
-        for i, opt in enumerate(self.options):
-            ox = self._opt_lx(i)
-            ow = self._opt_w[i]
-            tag = f"psel_{id(self)}_{i}"
-            active = (i == self.active_idx)
-
-            if active:
-                pill_ids = _fill_pill(self.cvs, ox, cy-h//2, ox+ow, cy+h//2,
-                                      self.color, tags=tag)
-                self._all_ids.extend(pill_ids)
-
-            text_color = TEXT_P if active else TEXT_DIM
-            tid = self.cvs.create_text(
-                ox + ow // 2, cy,
-                text=opt,
-                fill=text_color,
-                font=self.FONT,
-                anchor="center",
-                tags=tag
-            )
-            self._all_ids.append(tid)
-
-            # Invisible hit area
-            hit = self.cvs.create_rectangle(
-                ox, cy - h//2 - 2, ox+ow, cy + h//2 + 2,
-                fill="", outline="", tags=tag
-            )
-            self._all_ids.append(hit)
-
-            def _make_cb(idx):
-                return lambda e: self.select(idx)
-            self.cvs.tag_bind(tag, "<Button-1>", _make_cb(i))
-            self.cvs.tag_bind(tag, "<Enter>",
-                lambda e: self.cvs.configure(cursor="hand2"))
-            self.cvs.tag_bind(tag, "<Leave>",
-                lambda e: self.cvs.configure(cursor=""))
-
-    def select(self, new_idx: int) -> None:
-        """Change the active selection and redraw."""
-        if new_idx == self.active_idx:
-            return
-        self.active_idx = new_idx
-        self._draw()
-        if self._on_change:
-            self._on_change(new_idx)
-
-    @property
-    def value(self) -> str:
-        """Current selected option string."""
-        return self.options[self.active_idx]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Tooltip
-# ══════════════════════════════════════════════════════════════════════════════
-
-class CanvasTooltip:
-    """
-    Hover tooltip for Canvas items.
-
-    Args:
-        cvs:   The canvas.
-        tags:  Canvas tag(s) that trigger the tooltip.
-        text:  Text to display.
-        delay: Milliseconds before the tooltip appears.
-    """
-    def __init__(self, cvs: tk.Canvas, tags, text: str, delay: int = 500):
-        self._cvs   = cvs
-        self._text  = text
-        self._delay = delay
-        self._win   = None
-        self._job   = None
-
+class _Tooltip:
+    def __init__(self, cvs: tk.Canvas, tags, text: str):
+        self._cvs  = cvs
+        self._text = text
+        self._win: Optional[tk.Toplevel] = None
+        self._job  = None
         if isinstance(tags, str):
             tags = [tags]
         for tag in tags:
             cvs.tag_bind(tag, "<Enter>", self._schedule)
             cvs.tag_bind(tag, "<Leave>", self._cancel)
 
-    def update(self, text: str) -> None:
+    def update(self, text: str):
         self._text = text
 
     def _schedule(self, e):
         self._cancel()
-        self._last_e = e
-        self._job = self._cvs.after(self._delay, lambda: self._show(e))
+        self._job = self._cvs.after(500, lambda: self._show(e))
 
     def _cancel(self, _=None):
         if self._job:
@@ -516,25 +208,18 @@ class CanvasTooltip:
         self._hide()
 
     def _show(self, e):
-        x = self._cvs.winfo_rootx() + e.x
-        y = self._cvs.winfo_rooty() + e.y + 22
+        x = self._cvs.winfo_rootx() + e.x + 14
+        y = self._cvs.winfo_rooty() + e.y + 26
         self._win = tk.Toplevel(self._cvs)
-        self._win.wm_overrideredirect(True)
+        self._win.overrideredirect(True)
         self._win.attributes("-topmost", True)
-        self._win.attributes("-alpha", 0)
-        self._win.wm_geometry(f"+{x}+{y}")
-        tk.Label(
-            self._win, text=self._text,
-            bg="#1C1C28", fg="#D0D0E0",
-            font=("Segoe UI", 9),
-            padx=10, pady=5, relief="flat"
-        ).pack()
-        def _fade(t):
-            try:
-                self._win.attributes("-alpha", t * 0.95)
-            except Exception:
-                pass
-        Animator(self._win, 180, _fade).start()
+        self._win.geometry(f"+{x}+{y}")
+        self._win.configure(bg="#0A0A14")
+        tk.Frame(self._win, bg=C["border_dim"], height=1).pack(fill="x")
+        tk.Label(self._win, text=self._text,
+                 bg="#0A0A14", fg="#C0C0D8",
+                 font=F["button"],
+                 padx=10, pady=5).pack()
 
     def _hide(self):
         if self._win:
@@ -545,90 +230,167 @@ class CanvasTooltip:
             self._win = None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Screen Flash
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Pill Selector (inline FPS / Quality) ─────────────────────────────────────
 
-def screen_flash(root: tk.Tk) -> None:
-    """White full-screen flash simulating a camera shutter."""
-    try:
-        win = tk.Toplevel(root)
-        win.overrideredirect(True)
-        win.attributes("-fullscreen", True)
-        win.attributes("-topmost", True)
-        win.attributes("-alpha", 0.0)
-        win.configure(bg="#FFFFFF")
-        try:
-            hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
-            ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
-        except Exception:
-            pass
-        def _fade(t):
+class _PillSelector:
+    """
+    Inline pill-button selector drawn directly on the toolbar canvas.
+    Displays a label + N fixed-width option pills.
+    The active option is highlighted with a filled pill behind its text.
+    Clicking redraws instantly.
+    """
+    OPT_W   = 30    # px per option
+    OPT_H   = 20    # pill height
+    OPT_GAP = 2     # gap between options
+    LBL_W   = 22    # label reserve
+
+    def __init__(self, cvs: tk.Canvas, x: int, cy: int,
+                 options, active_idx: int,
+                 accent: str, label: str,
+                 on_change: Callable[[int], None] = None):
+        self.cvs        = cvs
+        self.x          = x
+        self.cy         = cy
+        self.options    = options
+        self.active_idx = active_idx
+        self.accent     = accent
+        self.label_str  = label
+        self._on_change = on_change
+        self._ids       = []
+        self._draw()
+
+    @property
+    def total_width(self) -> int:
+        n = len(self.options)
+        return self.LBL_W + n * self.OPT_W + (n - 1) * self.OPT_GAP
+
+    def _opt_x(self, i: int) -> int:
+        return self.x + self.LBL_W + i * (self.OPT_W + self.OPT_GAP)
+
+    def _draw(self):
+        for iid in self._ids:
             try:
-                win.attributes("-alpha", 0.16 * (1 - t))
+                self.cvs.delete(iid)
             except Exception:
                 pass
-        Animator(win, 260, _fade, on_complete=win.destroy).start()
-    except Exception as e:
-        log.error("Screen flash error: %s", e)
+        self._ids.clear()
+
+        cy  = self.cy
+        h   = self.OPT_H
+
+        # Label
+        self._ids.append(self.cvs.create_text(
+            self.x, cy, text=self.label_str,
+            fill=C["text_dim"], font=F["label"], anchor="w"
+        ))
+
+        # Track background
+        n = len(self.options)
+        tx1 = self.x + self.LBL_W - 2
+        tx2 = self.x + self.total_width + 2
+        _fill_rrect(self.cvs, tx1, cy-h//2, tx2, cy+h//2,
+                    h//2, C["bg_sunken"])
+
+        # Options
+        for i, opt in enumerate(self.options):
+            ox  = self._opt_x(i)
+            tag = f"psel_{id(self)}_{i}"
+            is_active = (i == self.active_idx)
+
+            if is_active:
+                # Active pill fill
+                _fill_rrect(self.cvs,
+                            ox+1, cy-h//2+2,
+                            ox+self.OPT_W-1, cy+h//2-2,
+                            h//2-2, self.accent)
+
+            tc = C["text_primary"] if is_active else C["text_secondary"]
+            tid = self.cvs.create_text(
+                ox + self.OPT_W // 2, cy,
+                text=opt, fill=tc,
+                font=F["button"],
+                anchor="center", tags=tag
+            )
+            self._ids.append(tid)
+
+            hit = self.cvs.create_rectangle(
+                ox, cy-h//2-2, ox+self.OPT_W, cy+h//2+2,
+                fill="", outline="", tags=tag
+            )
+            self._ids.append(hit)
+
+            def _make_cb(idx):
+                return lambda _: self.select(idx)
+            self.cvs.tag_bind(tag, "<Button-1>", _make_cb(i))
+            self.cvs.tag_bind(tag, "<Enter>",
+                              lambda e: self.cvs.configure(cursor="hand2"))
+            self.cvs.tag_bind(tag, "<Leave>",
+                              lambda e: self.cvs.configure(cursor=""))
+
+    def select(self, idx: int):
+        if idx == self.active_idx:
+            return
+        self.active_idx = idx
+        self._draw()
+        if self._on_change:
+            self._on_change(idx)
+
+    @property
+    def value(self) -> str:
+        return self.options[self.active_idx]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# The Toolbar
+# Toolbar
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Toolbar(tk.Tk):
     """
     Main floating toolbar for Soumo Screen Recorder PRO.
 
-    A pill-shaped, frameless, always-on-top window built entirely
-    on a single Canvas. Every button, label, and selector is a Canvas
-    drawing item — no Tkinter frames or standard widgets.
-
-    Uses Windows transparentcolor to achieve the true pill shape by
-    making the canvas background (_HOLE color) transparent.
+    A frameless, always-on-top pill-shaped window.
+    The entire UI is drawn on a single Canvas.
+    Every button uses the new Animator with hover/press/spring physics.
     """
 
-    H  = BAR_H
-    W  = BAR_W
-    R  = RADIUS
+    H = BAR_H
+    W = BAR_W
+    R = BAR_R
 
     def __init__(self):
         super().__init__()
+        log.info("Toolbar starting — Python %s", sys.version.split()[0])
 
-        log.info("Toolbar init — Python %s", sys.version.split()[0])
+        self._settings  = load_settings()
+        self._recorder  = ScreenRecorder()
+        self._recorder.set_timer_callback(self._on_timer_tick)
+        self._hotkeys   = HotkeyManager()
+        self._toasts    = ToastManager(self)
+        self._region:   Optional[Tuple[int,int,int,int]] = None
+        self._settings_panel: Optional[SettingsPanel] = None
+        self._rec_lock  = threading.Lock()
+        self._drag_ox   = 0
+        self._drag_oy   = 0
 
-        self._settings   = load_settings()
-        self._recorder   = ScreenRecorder()
-        self._recorder.set_timer_callback(self._on_timer)
-        self._hotkeys    = HotkeyManager()
-        self._region: Optional[Tuple[int, int, int, int]] = None
-        self._settings_win: Optional[SettingsPanel] = None
-        self._rec_lock   = threading.Lock()
-        self._drag_ox    = self._drag_oy = 0
-        self._rec_pulse: Optional[PulseLoop] = None
-        self._rec_bar_pulse: Optional[PulseLoop] = None
-        self._pause_btn: Optional[CanvasButton] = None
-        self._enabled    = True
+        self.animator   = Animator(self)
+        self._btn_info: Dict[str, Dict] = {}
 
-        # Window setup
+        # ── Window ────────────────────────────────────────────────────────
         self.overrideredirect(True)
         self.attributes("-topmost", True)
         self.attributes("-alpha", 0.0)
         self.wm_attributes("-transparentcolor", _HOLE)
         self.configure(bg=_HOLE)
 
-        # Initial position
-        sw = self.winfo_screenwidth()
-        sx = self._settings.toolbar_x
-        sy = self._settings.toolbar_y
+        sw  = self.winfo_screenwidth()
+        sx  = self._settings.toolbar_x
+        sy  = self._settings.toolbar_y
         if sx < 0 or sx + self.W > sw:
             sx = (sw - self.W) // 2
-        if sy < 0:
-            sy = 12
+        sy = max(sy, 10)
         self.geometry(f"{self.W}x{self.H}+{sx}+{sy}")
 
-        # Main canvas
+        # ── Canvas ─────────────────────────────────────────────────────────
         self.cvs = tk.Canvas(
             self, width=self.W, height=self.H,
             bg=_HOLE, highlightthickness=0, bd=0
@@ -638,268 +400,437 @@ class Toolbar(tk.Tk):
         self._build()
         self._apply_capture_exclusion()
         self._register_hotkeys()
-        self.after(80, self._animate_in)
-        self.bind("<Configure>", self._on_configure)
+        self.after(100, self._slide_in)
+        self.bind("<Configure>", self._save_pos)
 
-    # ── Capture exclusion ─────────────────────────────────────────────────────
+    # ── Setup ──────────────────────────────────────────────────────────────
 
     def _apply_capture_exclusion(self):
         try:
             hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-            result = ctypes.windll.user32.SetWindowDisplayAffinity(
-                hwnd, WDA_EXCLUDEFROMCAPTURE)
-            log.info("SetWindowDisplayAffinity: %d", result)
+            ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+            log.info("WDA_EXCLUDEFROMCAPTURE applied")
         except Exception as e:
-            log.error("Capture exclusion failed: %s", e)
+            log.warning("Capture exclusion failed: %s", e)
 
-    # ── Build the toolbar ─────────────────────────────────────────────────────
+    def _register_hotkeys(self):
+        self._hotkeys.register("ctrl+shift+r",
+                               lambda: self.after(0, self._toggle_record))
+        self._hotkeys.register("ctrl+shift+s",
+                               lambda: self.after(0, self._do_screenshot))
+
+    # ── Build ──────────────────────────────────────────────────────────────
 
     def _build(self):
         cvs = self.cvs
         W, H, R = self.W, self.H, self.R
         cy = H // 2
 
-        # ── Background pill ───────────────────────────────────────────────────
-        # Main fill
-        _fill_pill(cvs, 0, 0, W, H, BG_MAIN, tags="bg")
-        # Top 1px highlight line (simulates light on top rim)
-        cvs.create_line(R, 1, W-R, 1, fill=HIGHLIGHT, width=1, tags="bg")
-        # Top-left arc highlight
-        cvs.create_arc(0, 0, 2*R, H, start=90, extent=90,
-                       style="arc", outline=HIGHLIGHT, width=1, tags="bg")
-        # Top-right arc highlight
-        cvs.create_arc(W-2*R, 0, W, H, start=0, extent=90,
-                       style="arc", outline=HIGHLIGHT, width=1, tags="bg")
+        # ── Background layers ──────────────────────────────────────────────
+        # Drop shadow (slightly offset, slightly larger dark pill)
+        _fill_pill(cvs, 2, 4, W-2, H+4, "#020208")
+        # Main surface
+        _fill_pill(cvs, 0, 0, W, H, C["bg_surface"], tags="bg")
+        # Top rim light (simulates glass catching top light)
+        cvs.create_line(R, 1, W-R, 1, fill="#FFFFFF0F", width=1)
+        # Bottom rim dark
+        cvs.create_line(R, H-1, W-R, H-1, fill="#00000055", width=1)
         # Outer border
-        _outline_pill(cvs, 0, 0, W, H, BORDER, width=1, tags="bg")
+        _outline_pill(cvs, 0, 0, W, H, C["border_subtle"], width=1)
 
-        cvs.tag_bind("bg", "<ButtonPress-1>",  self._drag_start)
-        cvs.tag_bind("bg", "<B1-Motion>",      self._drag_move)
+        # Drag on background
+        cvs.tag_bind("bg", "<ButtonPress-1>", self._drag_start)
+        cvs.tag_bind("bg", "<B1-Motion>",     self._drag_move)
 
-        # ── Layout x positions ────────────────────────────────────────────────
-        x = 14   # left cursor
+        x = 14
 
-        # Grip (6 dots in 2x3 grid)
-        gx = x + 2
+        # ── Grip dots ──────────────────────────────────────────────────────
+        gx = x + 1
         for row in range(3):
             for col in range(2):
-                dot = cvs.create_oval(
-                    gx + col*5, cy - 6 + row*6,
-                    gx + col*5 + 2, cy - 6 + row*6 + 2,
-                    fill=TEXT_DIM, outline="", tags="grip"
+                cvs.create_oval(
+                    gx + col*5, cy-5+row*5,
+                    gx + col*5+2, cy-5+row*5+2,
+                    fill=C["text_dim"], outline="", tags="grip"
                 )
-        cvs.tag_bind("grip", "<ButtonPress-1>",  self._drag_start)
-        cvs.tag_bind("grip", "<B1-Motion>",      self._drag_move)
+        cvs.tag_bind("grip", "<ButtonPress-1>", self._drag_start)
+        cvs.tag_bind("grip", "<B1-Motion>",     self._drag_move)
         cvs.tag_bind("grip", "<Enter>", lambda _: cvs.configure(cursor="fleur"))
         cvs.tag_bind("grip", "<Leave>", lambda _: cvs.configure(cursor=""))
-        x += 20
+        x += 16
 
-        # Red dot (macOS style — your brand color)
-        cvs.create_oval(x, cy-4, x+8, cy+4, fill=RED, outline="", tags="dot")
+        # ── Brand dot (macOS-style red dot = your brand color) ────────────
+        cvs.create_oval(x, cy-4, x+8, cy+4,
+                        fill=C["red"], outline="")
         x += 14
 
-        # Brand text  (spacing1 is Text-widget only — invalid on canvas items)
+        # ── Brand text ─────────────────────────────────────────────────────
         cvs.create_text(x, cy, text="SOUMO",
-                        fill="#5A5A8A",
-                        font=_safe_font("Segoe UI Variable", "Segoe UI", 10, "bold"),
-                        anchor="w", tags="brand")
-        cvs.tag_bind("brand", "<ButtonPress-1>",  self._drag_start)
-        cvs.tag_bind("brand", "<B1-Motion>",      self._drag_move)
-        x += 62
+                        fill=C["text_secondary"],
+                        font=F["brand"],
+                        anchor="w", tags="brand_text")
+        cvs.tag_bind("brand_text", "<ButtonPress-1>", self._drag_start)
+        cvs.tag_bind("brand_text", "<B1-Motion>",     self._drag_move)
+        x += 56
 
-        # Divider
-        x = self._divider(cvs, x, H)
-        x += 8
+        # ── Divider ────────────────────────────────────────────────────────
+        x = self._divider(x) + 12
 
-        # ── Action buttons ────────────────────────────────────────────────────
-        btn_y = cy
-        gap   = 6
+        # ── Buttons ────────────────────────────────────────────────────────
+        R_BTN = 16  # button circle radius
 
-        # Screenshot button
-        self._btn_shot = CanvasButton(
-            cvs, x + 18, btn_y,
-            BTN_SHOT_IDLE, BTN_SHOT_HOV,
-            draw_icon_camera, command=self._take_screenshot,
-            tag="btn_shot"
+        # Screenshot
+        self._btn(
+            x + R_BTN, cy, R_BTN, "btn_cam",
+            _icon_camera,
+            bg=(C["blue_dim"],   "#1A3A5C"),
+            bd=(C["border_dim"], C["blue"]),
+            ic=(C["text_secondary"], C["blue"]),
+            cmd=self._do_screenshot
         )
-        CanvasTooltip(cvs, ["btn_shot", "btn_shot_icon"],
-                      "Screenshot  [Ctrl+Shift+S]")
-        x += 36 + gap
+        self._tt_cam = _Tooltip(cvs,
+            ["btn_cam", "btn_cam_bg", "btn_cam_icon"],
+            "Screenshot   Ctrl+Shift+S")
+        x += R_BTN*2 + 5
 
-        # Record button
-        self._btn_rec = CanvasButton(
-            cvs, x + 18, btn_y,
-            BTN_REC_IDLE, BTN_REC_HOV,
-            draw_icon_record, command=self._toggle_record,
-            tag="btn_rec"
+        # Record  (shares position with Pause — one is hidden at all times)
+        self._btn(
+            x + R_BTN, cy, R_BTN, "btn_rec",
+            _icon_record,
+            bg=(C["red_dim"],  "#4A1515"),
+            bd=("#4A1515",     C["red"]),
+            ic=(C["red"],      C["red_glow"]),
+            cmd=self._toggle_record
         )
-        self._btn_rec.set_icon_color(RED)
-        self._tt_rec = CanvasTooltip(cvs, ["btn_rec", "btn_rec_icon"],
-                                      "Start Recording  [Ctrl+Shift+R]")
-        x += 36 + gap
+        self._tt_rec = _Tooltip(cvs,
+            ["btn_rec", "btn_rec_bg", "btn_rec_icon"],
+            "Start Recording   Ctrl+Shift+R")
 
-        # Pause button (hidden until recording)
-        self._pause_cx = x + 18
-        self._pause_cy = btn_y
-        self._btn_pause = CanvasButton(
-            cvs, x + 18, btn_y,
-            BTN_PAUSE_IDLE, BTN_PAUSE_HOV,
-            draw_icon_pause, command=self._toggle_pause,
-            tag="btn_pause"
+        self._btn(
+            x + R_BTN, cy, R_BTN, "btn_pause",
+            _icon_pause,
+            bg=(C["amber_dim"], "#3A2C00"),
+            bd=("#3A2C00",      C["amber"]),
+            ic=(C["amber"],     "#FFD040"),
+            cmd=self._toggle_pause
         )
-        self._btn_pause.hide()
-        x += 36 + gap
+        _Tooltip(cvs,
+            ["btn_pause", "btn_pause_bg", "btn_pause_icon"],
+            "Pause / Resume recording")
+        self._hide_btn("btn_pause")
+        x += R_BTN*2 + 5
 
-        # Region button
-        self._btn_reg = CanvasButton(
-            cvs, x + 18, btn_y,
-            BTN_REG_IDLE, BTN_REG_HOV,
-            draw_icon_region, command=self._select_region,
-            tag="btn_reg"
+        # Region select
+        self._btn(
+            x + R_BTN, cy, R_BTN, "btn_region",
+            _icon_region,
+            bg=(C["purple_dim"], "#2A1A48"),
+            bd=("#2A1A48",       C["purple"]),
+            ic=(C["text_secondary"], C["purple"]),
+            cmd=self._do_region
         )
-        cvs.tag_bind("btn_reg", "<Button-3>", lambda _: self._clear_region())
-        self._tt_reg = CanvasTooltip(cvs, ["btn_reg", "btn_reg_icon"],
-                                      "Select region  [Right-click to clear]")
-        x += 36 + gap
+        cvs.tag_bind("btn_region", "<Button-3>",
+                     lambda _: self._clear_region())
+        _Tooltip(cvs,
+            ["btn_region", "btn_region_bg", "btn_region_icon"],
+            "Select capture region   Right-click clears")
+        x += R_BTN*2 + 5
 
-        # Folder button
-        self._btn_folder = CanvasButton(
-            cvs, x + 18, btn_y,
-            BTN_FOLD_IDLE, BTN_FOLD_HOV,
-            draw_icon_folder, command=self._open_folder,
-            tag="btn_folder"
+        # Open folder
+        self._btn(
+            x + R_BTN, cy, R_BTN, "btn_folder",
+            _icon_folder,
+            bg=(C["green_dim"], "#1A3A28"),
+            bd=("#1A3A28",      C["green"]),
+            ic=(C["text_secondary"], C["green"]),
+            cmd=self._open_folder
         )
-        CanvasTooltip(cvs, ["btn_folder", "btn_folder_icon"], "Open Recordings folder")
-        x += 36 + 8
+        _Tooltip(cvs,
+            ["btn_folder", "btn_folder_bg", "btn_folder_icon"],
+            "Open recordings folder")
+        x += R_BTN*2 + 5
 
-        # Region label
+        # Settings
+        self._btn(
+            x + R_BTN, cy, R_BTN, "btn_settings",
+            _icon_settings,
+            bg=(C["bg_elevated"], "#1E1E2C"),
+            bd=(C["border_dim"],  C["purple"]),
+            ic=(C["text_secondary"], C["purple"]),
+            cmd=self._open_settings
+        )
+        _Tooltip(cvs,
+            ["btn_settings", "btn_settings_bg", "btn_settings_icon"],
+            "Settings")
+        x += R_BTN*2 + 10
+
+        # Region label (shows "Full Screen" or "1920×1080")
         self._region_tid = cvs.create_text(
             x, cy, text="Full Screen",
-            fill=TEXT_VDM, font=("Segoe UI", 8),
+            fill=C["text_dim"],
+            font=("Segoe UI", 8),
             anchor="w"
         )
-        x += 68
+        x += 66
 
-        # Divider
-        x = self._divider(cvs, x, H)
-        x += 10
+        # ── Divider ────────────────────────────────────────────────────────
+        x = self._divider(x) + 12
 
-        # ── FPS selector ──────────────────────────────────────────────────────
+        # ── FPS Selector ───────────────────────────────────────────────────
         fps_opts = ["30", "60", "120", "144"]
-        fps_vals = [30, 60, 120, 144]
+        fps_vals = [30,   60,  120,  144]
+        fps_idx  = 1
         try:
-            fps_active = fps_vals.index(self._settings.fps)
+            fps_idx = fps_vals.index(self._settings.fps)
         except ValueError:
-            fps_active = 1  # default 60
+            pass
 
-        self._fps_sel = PillSelector(
+        self._fps_sel = _PillSelector(
             cvs, x, cy,
             options=fps_opts,
-            active_idx=fps_active,
-            color=RED,
+            active_idx=fps_idx,
+            accent=C["red"],
             label="FPS",
-            on_change=lambda idx: self._on_fps_change(fps_vals[idx])
+            on_change=lambda i: self._on_fps(fps_vals[i])
         )
-        x += self._fps_sel.total_width + 12
+        x += self._fps_sel.total_width + 10
 
-        # ── Quality selector ──────────────────────────────────────────────────
-        q_opts   = ["Lo", "Med", "Hi", "Ultra"]
-        q_vals   = ["Low", "Medium", "High", "Ultra"]
+        # ── Quality Selector ───────────────────────────────────────────────
+        q_opts = ["Lo",   "Med",    "Hi",    "4K"]
+        q_vals = ["Low",  "Medium", "High",  "Ultra"]
+        q_idx  = 2
         try:
-            q_active = q_vals.index(self._settings.quality)
+            q_idx = q_vals.index(self._settings.quality)
         except ValueError:
-            q_active = 2  # default High
+            pass
 
-        self._q_sel = PillSelector(
+        self._q_sel = _PillSelector(
             cvs, x, cy,
             options=q_opts,
-            active_idx=q_active,
-            color=BLUE,
+            active_idx=q_idx,
+            accent=C["blue"],
             label="Q",
-            on_change=lambda idx: self._on_quality_change(q_vals[idx])
+            on_change=lambda i: self._on_quality(q_vals[i])
         )
-        x += self._q_sel.total_width + 8
+        x += self._q_sel.total_width + 10
 
-        # Divider
-        x = self._divider(cvs, x, H)
-        x += 12
+        # ── Divider ────────────────────────────────────────────────────────
+        x = self._divider(x) + 12
 
-        # ── Timer ─────────────────────────────────────────────────────────────
-        self._timer_color = TEXT_DIM
-        self._timer_text  = "00:00:00"
-        self._timer_tid   = cvs.create_text(
+        # ── Timer ─────────────────────────────────────────────────────────
+        self._timer_tid = cvs.create_text(
             x, cy, text="00:00:00",
-            fill=TEXT_DIM,
-            font=("Consolas", 14, "bold"),
+            fill=C["text_dim"],
+            font=F["timer"],
             anchor="w"
         )
-        x += 86
+        x += 94
 
-        # Divider
-        x = self._divider(cvs, x, H)
-        x += 8
-
-        # ── Gear / Settings ───────────────────────────────────────────────────
-        self._btn_gear = CanvasButton(
-            cvs, x + 16, cy,
-            "#1A1A28", "#2A2A40",
-            draw_icon_gear, command=self._open_settings,
-            tag="btn_gear", radius=14
-        )
-        CanvasTooltip(cvs, ["btn_gear", "btn_gear_icon"], "Settings")
-        x += 36
-
-        # ── Close button ──────────────────────────────────────────────────────
+        # ── Close ─────────────────────────────────────────────────────────
         self._close_tid = cvs.create_text(
-            x + 4, cy, text="✕",
-            fill=TEXT_DIM,
-            font=("Segoe UI", 12),
-            anchor="w",
-            tags="close_btn"
+            x, cy, text="✕",
+            fill=C["text_dim"],
+            font=("Segoe UI", 11),
+            anchor="w", tags="close_btn"
         )
         cvs.tag_bind("close_btn", "<Button-1>", lambda _: self._quit())
         cvs.tag_bind("close_btn", "<Enter>",
-                     lambda _: cvs.itemconfigure(self._close_tid, fill=RED2))
+                     lambda _: cvs.itemconfig(self._close_tid, fill=C["red"]))
         cvs.tag_bind("close_btn", "<Leave>",
-                     lambda _: cvs.itemconfigure(self._close_tid, fill=TEXT_DIM))
-        CanvasTooltip(cvs, "close_btn", "Quit Soumo Recorder")
+                     lambda _: cvs.itemconfig(self._close_tid, fill=C["text_dim"]))
 
-        # ── Recording bottom bar ──────────────────────────────────────────────
-        self._rec_bar_ids: List[int] = []
-        self._rec_bar_visible = False
+        # ── Recording bottom bar ───────────────────────────────────────────
+        self._rec_bar = cvs.create_line(
+            R, H-1, W-R, H-1,
+            fill=C["red"], width=2,
+            state="hidden"
+        )
 
-        log.info("Toolbar built. Total width used: ~%d / %d", x, self.W)
+        log.info("Toolbar built. Width cursor: %d / %d", x, self.W)
 
-    def _divider(self, cvs: tk.Canvas, x: int, H: int) -> int:
-        """Draw a 1px vertical divider and return the right edge x."""
-        mid = H // 2
-        cvs.create_line(x+1, mid-10, x+1, mid+10, fill=DIVIDER, width=1)
+    def _divider(self, x: int) -> int:
+        mid = self.H // 2
+        self.cvs.create_line(x+1, mid-10, x+1, mid+10,
+                              fill=C["border_subtle"], width=1)
         return x + 2
 
-    # ── Slide-in animation ────────────────────────────────────────────────────
+    # ── Button system ──────────────────────────────────────────────────────
 
-    def _animate_in(self):
+    def _btn(self, cx, cy, r, tag,
+             icon_fn: Callable,
+             bg: Tuple[str, str],
+             bd: Tuple[str, str],
+             ic: Tuple[str, str],
+             cmd: Optional[Callable] = None):
+        """
+        Draw a circular button and bind hover/press/release animations.
+
+        Args:
+            cx, cy:  Center coordinates.
+            r:       Radius in pixels.
+            tag:     Unique tag string.
+            icon_fn: Icon drawing function(cvs, cx, cy, color, tags).
+            bg:      (idle_fill, hover_fill) hex colors.
+            bd:      (idle_border, hover_border) hex colors.
+            ic:      (idle_icon, hover_icon) hex colors.
+            cmd:     Click command callable.
+        """
+        self._btn_info[tag] = {
+            "cx": cx, "cy": cy, "r": r,
+            "bg_idle": bg[0], "bg_hover": bg[1],
+            "bd_idle": bd[0], "bd_hover": bd[1],
+            "ic_idle": ic[0], "ic_hover": ic[1],
+        }
+
+        # Circle background
+        self.cvs.create_oval(
+            cx-r, cy-r, cx+r, cy+r,
+            fill=bg[0], outline=bd[0], width=1,
+            tags=(tag, tag+"_bg")
+        )
+
+        # Icon
+        icon_fn(self.cvs, cx, cy, ic[0], tags=(tag, tag+"_icon"))
+
+        # Bind events on all sub-items
+        for sub in (tag, tag+"_bg", tag+"_icon"):
+            self.cvs.tag_bind(sub, "<Enter>",
+                lambda e, t=tag: self._enter(t))
+            self.cvs.tag_bind(sub, "<Leave>",
+                lambda e, t=tag: self._leave(t))
+            self.cvs.tag_bind(sub, "<ButtonPress-1>",
+                lambda e, t=tag: self._press(t))
+            self.cvs.tag_bind(sub, "<ButtonRelease-1>",
+                lambda e, t=tag, c=cmd: self._release(t, c))
+
+    def _enter(self, tag: str):
+        self.animator.animate(f"{tag}_h", 0.0, 1.0, 120, "ease_out_cubic",
+            on_update=lambda v: self._color_btn(tag, v))
+
+    def _leave(self, tag: str):
+        self.animator.animate(f"{tag}_h", 1.0, 0.0, 200, "ease_in_out_sine",
+            on_update=lambda v: self._color_btn(tag, v))
+
+    def _press(self, tag: str):
+        self.animator.animate(f"{tag}_s", 1.0, 0.86, 80, "ease_out_cubic",
+            on_update=lambda v: self._scale_btn(tag, v))
+
+    def _release(self, tag: str, cmd: Optional[Callable]):
+        self.animator.animate(f"{tag}_s", 0.86, 1.0, 300, "spring",
+            on_update=lambda v: self._scale_btn(tag, v))
+        if cmd:
+            self.after(20, cmd)
+
+    def _color_btn(self, tag: str, t: float):
+        info = self._btn_info.get(tag)
+        if not info:
+            return
+        bg = interpolate_color(info["bg_idle"], info["bg_hover"], t)
+        bd = interpolate_color(info["bd_idle"], info["bd_hover"], t)
+        ic = interpolate_color(info["ic_idle"], info["ic_hover"], t)
+        try:
+            self.cvs.itemconfig(tag+"_bg",   fill=bg, outline=bd)
+            self.cvs.itemconfig(tag+"_icon", fill=ic, outline=ic)
+        except Exception:
+            pass
+
+    def _scale_btn(self, tag: str, scale: float):
+        info = self._btn_info.get(tag)
+        if not info:
+            return
+        cx, cy, r = info["cx"], info["cy"], info["r"]
+        sr = r * scale
+        try:
+            self.cvs.coords(tag+"_bg", cx-sr, cy-sr, cx+sr, cy+sr)
+        except Exception:
+            pass
+
+    def _hide_btn(self, tag: str):
+        for sub in (tag, tag+"_bg", tag+"_icon"):
+            try:
+                self.cvs.itemconfig(sub, state="hidden")
+            except Exception:
+                pass
+
+    def _show_btn(self, tag: str):
+        for sub in (tag, tag+"_bg", tag+"_icon"):
+            try:
+                self.cvs.itemconfig(sub, state="normal")
+            except Exception:
+                pass
+
+    # ── Recording bar & pulse ──────────────────────────────────────────────
+
+    def _show_rec_bar(self):
+        self.cvs.itemconfig(self._rec_bar, state="normal")
+        self.animator.pulse(
+            "rec_bar", period_ms=1600,
+            on_update=lambda v: self.cvs.itemconfig(
+                self._rec_bar,
+                fill=interpolate_color(C["red"], C["red_glow"], v)
+            )
+        )
+
+    def _hide_rec_bar(self):
+        self.animator.stop("rec_bar")
+        self.cvs.itemconfig(self._rec_bar, state="hidden")
+
+    def _start_rec_pulse(self):
+        self.animator.pulse(
+            "rec_pulse", period_ms=1800,
+            on_update=self._apply_rec_glow
+        )
+
+    def _apply_rec_glow(self, v: float):
+        bg = interpolate_color("#2D0E0F", "#5A1818", v)
+        bd = interpolate_color("#4A1515", C["red"],      v)
+        ic = interpolate_color("#8B1A1A", C["red_glow"], v)
+        try:
+            self.cvs.itemconfig("btn_rec_bg",   fill=bg, outline=bd)
+            self.cvs.itemconfig("btn_rec_icon", fill=ic, outline=ic)
+        except Exception:
+            pass
+
+    def _stop_rec_pulse(self):
+        self.animator.stop("rec_pulse")
+        info = self._btn_info.get("btn_rec", {})
+        try:
+            self.cvs.itemconfig("btn_rec_bg",
+                fill=info.get("bg_idle", C["red_dim"]),
+                outline=info.get("bd_idle", "#4A1515"))
+            self.cvs.itemconfig("btn_rec_icon",
+                fill=C["red"], outline=C["red"])
+        except Exception:
+            pass
+
+    # ── Slide-in animation ─────────────────────────────────────────────────
+
+    def _slide_in(self):
         x     = self.winfo_x()
         y_end = self.winfo_y()
-        y_st  = -self.H - 20
-        def _upd(t):
-            yy = int(y_st + (y_end - y_st) * ease_out_cubic(t))
-            self.geometry(f"+{x}+{yy}")
-            self.attributes("-alpha", t)
-        Animator(self, 400, _upd).start()
+        self.animator.animate(
+            "slide_in",
+            start=float(-self.H - 10),
+            end=float(y_end),
+            duration_ms=420,
+            easing="ease_out_cubic",
+            on_update=lambda y: (
+                self.geometry(f"+{x}+{int(y)}"),
+                self.attributes("-alpha", max(0.0, min(1.0,
+                    (y + self.H + 10) / max(y_end + self.H + 10, 1))))
+            )
+        )
 
-    # ── Drag ──────────────────────────────────────────────────────────────────
+    # ── Drag ──────────────────────────────────────────────────────────────
 
     def _drag_start(self, e):
         self._drag_ox = e.x_root - self.winfo_x()
         self._drag_oy = e.y_root - self.winfo_y()
 
     def _drag_move(self, e):
-        x = e.x_root - self._drag_ox
-        y = e.y_root - self._drag_oy
-        self.geometry(f"+{x}+{y}")
+        self.geometry(f"+{e.x_root - self._drag_ox}+{e.y_root - self._drag_oy}")
 
-    def _on_configure(self, _=None):
+    def _save_pos(self, _=None):
         try:
             self._settings.toolbar_x = self.winfo_x()
             self._settings.toolbar_y = self.winfo_y()
@@ -907,103 +838,53 @@ class Toolbar(tk.Tk):
         except Exception:
             pass
 
-    # ── Hotkeys ───────────────────────────────────────────────────────────────
+    # ── Timer (called from recorder background thread) ─────────────────────
 
-    def _register_hotkeys(self):
-        self._hotkeys.register("ctrl+shift+r",
-                               lambda: self.after(0, self._toggle_record))
-        self._hotkeys.register("ctrl+shift+s",
-                               lambda: self.after(0, self._take_screenshot))
+    def _on_timer_tick(self, time_str: str):
+        if self._recorder.is_paused:
+            return
+        self.after(0, lambda: self._set_timer(time_str, C["red"]))
 
-    # ── Inline selectors ──────────────────────────────────────────────────────
+    def _set_timer(self, text: str, color: str = None):
+        if color is None:
+            color = C["text_dim"]
+        try:
+            self.cvs.itemconfig(self._timer_tid, text=text, fill=color)
+        except Exception:
+            pass
 
-    def _on_fps_change(self, fps: int):
+    # ── Selectors ──────────────────────────────────────────────────────────
+
+    def _on_fps(self, fps: int):
         self._settings.fps = fps
         save_settings(self._settings)
-        log.info("FPS changed to %d", fps)
 
-    def _on_quality_change(self, quality: str):
+    def _on_quality(self, quality: str):
         self._settings.quality = quality
         save_settings(self._settings)
-        log.info("Quality changed to %s", quality)
 
-    # ── Thread-safe UI helpers ────────────────────────────────────────────────
-
-    def _ui(self, fn: Callable) -> None:
-        """Run fn on the main thread. Safe to call from any background thread."""
-        self.after(0, fn)
-
-    def _set_timer(self, text: str, color: str = TEXT_DIM) -> None:
-        """Update timer display (must be called on main thread)."""
-        self._timer_text  = text
-        self._timer_color = color
-        self.cvs.itemconfigure(self._timer_tid, text=text, fill=color)
-
-    def _set_region_label(self, text: str, color: str = TEXT_VDM) -> None:
-        self.cvs.itemconfigure(self._region_tid, text=text, fill=color)
-
-    def _show_rec_bar(self) -> None:
-        """Show the 2px red bottom recording bar."""
-        for iid in self._rec_bar_ids:
-            try:
-                self.cvs.delete(iid)
-            except Exception:
-                pass
-        # Draw a thin line at the bottom of the pill
-        ids = []
-        ids.append(self.cvs.create_line(
-            self.R, self.H-2, self.W-self.R, self.H-2,
-            fill=RED, width=2, tags="recbar"
-        ))
-        self._rec_bar_ids = ids
-        self._rec_bar_visible = True
-        # Pulse it
-        self._rec_bar_pulse = PulseLoop(
-            self, 1600,
-            on_update=lambda t: self.cvs.itemconfigure(
-                "recbar", fill=lerp_color(RED, RED2, t))
-        )
-        self._rec_bar_pulse.start()
-
-    def _hide_rec_bar(self) -> None:
-        if self._rec_bar_pulse:
-            self._rec_bar_pulse.stop()
-            self._rec_bar_pulse = None
-        for iid in self._rec_bar_ids:
-            try:
-                self.cvs.delete(iid)
-            except Exception:
-                pass
-        self._rec_bar_ids = []
-        self._rec_bar_visible = False
-
-    # ── Actions ───────────────────────────────────────────────────────────────
+    # ── Actions ────────────────────────────────────────────────────────────
 
     def _open_folder(self):
-        path = self._settings.output_folder
-        os.makedirs(path, exist_ok=True)
-        os.startfile(path)
+        p = self._settings.output_folder
+        os.makedirs(p, exist_ok=True)
+        os.startfile(p)
 
     def _open_settings(self):
-        if self._settings_win and self._settings_win.winfo_exists():
-            self._settings_win.focus()
-            return
-        self._settings_win = SettingsPanel(
-            self, self._settings, self._recorder,
-            on_close=lambda: setattr(self, "_settings_win", None)
-        )
+        if not self._settings_panel:
+            self._settings_panel = SettingsPanel(
+                self, self._settings,
+                on_close=lambda: setattr(self, "_settings_panel", None)
+            )
+        self._settings_panel.toggle()
 
-    def _select_region(self):
+    def _do_region(self):
         if self._recorder.is_recording:
-            notify("Cannot Change Region", "Stop recording first.", kind="error")
+            self._toasts.show("Region Locked", "Stop recording first.", "error")
             return
-        self._ui(lambda: self._set_timer("SELECT", AMBER))
+        self._set_timer("SELECT", C["purple"])
         self.iconify()
-        self.after(220, self._launch_selector)
-
-    def _launch_selector(self):
-        rs = RegionSelector(self._on_region_done)
-        rs.run()
+        self.after(200, lambda: RegionSelector(self._on_region_done).run())
 
     def _on_region_done(self, region):
         self.deiconify()
@@ -1011,47 +892,72 @@ class Toolbar(tk.Tk):
         if region:
             l, t, r, b = region
             w, h = r-l, b-t
-            self._ui(lambda: (
-                self._set_region_label(f"{w}×{h}", AMBER),
-                self._set_timer("00:00:00", TEXT_DIM)
+            self.after(0, lambda: (
+                self.cvs.itemconfig(self._region_tid,
+                    text=f"{w}\u00d7{h}", fill=C["amber"]),
+                self._set_timer("00:00:00")
             ))
-            notify("Region Selected", f"{w}×{h} pixels", kind="info", duration=2000)
+            self._toasts.show("Region Set", f"{w}\u00d7{h} px", "info")
         else:
-            self._ui(lambda: (
-                self._set_region_label("Full Screen", TEXT_VDM),
-                self._set_timer("00:00:00", TEXT_DIM)
+            self.after(0, lambda: (
+                self.cvs.itemconfig(self._region_tid,
+                    text="Full Screen", fill=C["text_dim"]),
+                self._set_timer("00:00:00")
             ))
 
     def _clear_region(self):
         self._region = None
-        self._ui(lambda: self._set_region_label("Full Screen", TEXT_VDM))
-        notify("Region Cleared", "Now capturing full screen.", kind="info", duration=1500)
+        self.cvs.itemconfig(self._region_tid,
+            text="Full Screen", fill=C["text_dim"])
+        self._toasts.show("Region Cleared", "Capturing full screen.", "info")
 
-    def _take_screenshot(self):
-        idx  = self._settings.monitor
+    def _do_screenshot(self):
         ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(self._settings.output_folder,
                             f"Screenshot_{ts}.png")
         os.makedirs(self._settings.output_folder, exist_ok=True)
-
-        screen_flash(self)
-        self._ui(lambda: self._set_timer("SNAP!", BLUE))
+        self._flash()
+        self._set_timer("SNAP!", C["blue"])
 
         def _do():
             ok = take_screenshot(
-                monitor_index=idx,
+                monitor_index=self._settings.monitor,
                 output_path=path,
                 region=self._region,
                 copy_to_clipboard=self._settings.copy_screenshot,
             )
+            self.after(0, lambda: self._set_timer("00:00:00"))
             if ok:
-                notify("Screenshot Saved", os.path.basename(path), kind="info")
+                self._toasts.show("Screenshot Saved", os.path.basename(path),
+                                  "success", file_path=path)
             else:
-                notify("Screenshot Failed",
-                       "Could not capture frame. Check log.", kind="error")
-            self._ui(lambda: self._set_timer("00:00:00", TEXT_DIM))
+                self._toasts.show("Screenshot Failed",
+                                  "Could not capture frame.", "error")
 
-        threading.Thread(target=_do, daemon=True, name="soumo-ss").start()
+        threading.Thread(target=_do, daemon=True, name="ss").start()
+
+    def _flash(self):
+        """White full-screen flash (camera shutter effect)."""
+        try:
+            win = tk.Toplevel(self)
+            win.overrideredirect(True)
+            win.attributes("-fullscreen", True)
+            win.attributes("-topmost", True)
+            win.attributes("-alpha", 0.0)
+            win.configure(bg="#FFFFFF")
+            try:
+                hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+                ctypes.windll.user32.SetWindowDisplayAffinity(
+                    hwnd, WDA_EXCLUDEFROMCAPTURE)
+            except Exception:
+                pass
+            self.animator.animate(
+                "flash", 0.18, 0.0, 280, "ease_out_cubic",
+                on_update=lambda v: win.attributes("-alpha", max(0, v)),
+                on_done=win.destroy
+            )
+        except Exception:
+            pass
 
     def _toggle_record(self):
         if not self._rec_lock.acquire(blocking=False):
@@ -1065,17 +971,16 @@ class Toolbar(tk.Tk):
                 else:
                     self._start_recording()
         finally:
-            self.after(600, self._rec_lock.release)
+            self.after(800, self._rec_lock.release)
 
     def _start_recording(self):
-        self._enabled = False
         ts   = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         fps  = self._settings.fps
         qual = self._settings.quality
         ext  = {"MP4": "mp4", "MKV": "mkv", "WebM": "webm"}.get(
                    self._settings.output_format, "mp4")
-        name = f"soumo_{ts}_{qual}_{fps}fps.{ext}"
-        path = os.path.join(self._settings.output_folder, name)
+        path = os.path.join(self._settings.output_folder,
+                            f"soumo_{ts}_{qual}_{fps}fps.{ext}")
         os.makedirs(self._settings.output_folder, exist_ok=True)
 
         def _do():
@@ -1091,102 +996,73 @@ class Toolbar(tk.Tk):
                     mic_enabled=self._settings.mic_enabled,
                     output_format=self._settings.output_format,
                 )
-                self._ui(lambda: (
-                    self._btn_rec.set_icon_color(RED2),
-                    self._show_rec_bar(),
+                self.after(0, lambda: (
+                    self._hide_btn("btn_rec"),
+                    self._show_btn("btn_pause"),
                     self._start_rec_pulse(),
-                    self._btn_pause.show(),
-                    self._tt_rec.update("Stop Recording  [Ctrl+Shift+R]"),
+                    self._show_rec_bar(),
+                    self._tt_rec.update("Stop Recording   Ctrl+Shift+R"),
                 ))
-                self._enabled = True
             except RuntimeError as e:
-                notify("Recording Failed", str(e), kind="error")
-                self._ui(lambda: self._set_timer("ERROR", RED))
-                self._enabled = True
+                self._toasts.show("Recording Failed", str(e), "error")
+                self.after(0, lambda: self._set_timer("ERROR", C["red"]))
             except Exception as e:
-                log.exception("Unexpected recording start error: %s", e)
-                notify("Recording Error", str(e), kind="error")
-                self._enabled = True
+                log.exception("start_recording exception")
+                self._toasts.show("Error", str(e), "error")
 
-        threading.Thread(target=_do, daemon=True, name="soumo-start").start()
+        threading.Thread(target=_do, daemon=True, name="rec-start").start()
 
     def _stop_recording(self):
-        self._enabled = False
-        self._ui(lambda: (
+        self.after(0, lambda: (
+            self._show_btn("btn_rec"),
+            self._hide_btn("btn_pause"),
             self._stop_rec_pulse(),
             self._hide_rec_bar(),
-            self._btn_rec.set_icon_color(RED),
-            self._btn_pause.hide(),
-            self._set_timer("SAVING", AMBER),
-            self._tt_rec.update("Start Recording  [Ctrl+Shift+R]"),
+            self._set_timer("SAVING", C["amber"]),
+            self._tt_rec.update("Start Recording   Ctrl+Shift+R"),
         ))
 
         def _do():
             try:
                 self._recorder.stop_recording()
                 fname = os.path.basename(self._recorder.output_file)
-                self._ui(lambda: self._set_timer("✓ SAVED", GREEN))
-                notify("Recording Saved", fname, kind="success")
-                if self._settings.auto_open and self._recorder.output_file:
+                self.after(0, lambda: self._set_timer("\u2713 SAVED", C["green"]))
+                self._toasts.show("Recording Saved", fname, "success",
+                                  file_path=self._recorder.output_file)
+                if self._settings.auto_open:
                     try:
                         os.startfile(self._recorder.output_file)
                     except Exception:
                         pass
             except Exception as e:
-                log.exception("Stop error: %s", e)
-                notify("Save Error", str(e), kind="error")
-                self._ui(lambda: self._set_timer("ERROR", RED))
+                log.exception("stop_recording exception")
+                self._toasts.show("Save Failed", str(e), "error")
+                self.after(0, lambda: self._set_timer("ERROR", C["red"]))
             finally:
-                self._enabled = True
-                self.after(2500, lambda: self._set_timer("00:00:00", TEXT_DIM))
+                self.after(2800, lambda: self._set_timer("00:00:00"))
 
-        threading.Thread(target=_do, daemon=True, name="soumo-stop").start()
+        threading.Thread(target=_do, daemon=True, name="rec-stop").start()
 
     def _toggle_pause(self):
         if not self._recorder.is_recording:
             return
         if self._recorder.is_paused:
             self._recorder.resume_recording()
-            self._ui(lambda: self._set_timer("REC…", RED))
             self._start_rec_pulse()
         else:
             self._recorder.pause_recording()
+            self.animator.stop("rec_pulse")
+            self._set_timer("PAUSED", C["amber"])
+            # Reset button colors to idle
             self._stop_rec_pulse()
-            self._ui(lambda: self._set_timer("PAUSED", AMBER))
 
-    # ── Record pulse ──────────────────────────────────────────────────────────
-
-    def _start_rec_pulse(self):
-        if self._rec_pulse:
-            self._rec_pulse.stop()
-        self._rec_pulse = PulseLoop(
-            self, 1800,
-            on_update=lambda t: self._btn_rec.set_icon_color(
-                lerp_color(RED, "#FF8080", t))
-        )
-        self._rec_pulse.start()
-
-    def _stop_rec_pulse(self):
-        if self._rec_pulse:
-            self._rec_pulse.stop()
-            self._rec_pulse = None
-        self._btn_rec.set_icon_color(RED)
-
-    # ── Timer callback ────────────────────────────────────────────────────────
-
-    def _on_timer(self, time_str: str):
-        if self._recorder.is_recording and not self._recorder.is_paused:
-            self._ui(lambda: self._set_timer(time_str, RED))
-
-    # ── Quit ──────────────────────────────────────────────────────────────────
+    # ── Quit ──────────────────────────────────────────────────────────────
 
     def _quit(self):
-        log.info("Quit requested")
         self._hotkeys.unregister_all()
+        self.animator.stop_all()
         if self._recorder.is_recording:
-            threading.Thread(
-                target=self._recorder.stop_recording,
-                daemon=True
-            ).start()
+            threading.Thread(target=self._recorder.stop_recording,
+                            daemon=True).start()
         save_settings(self._settings)
         self.after(300, self.destroy)

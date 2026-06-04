@@ -1,290 +1,204 @@
 """
 utils/animations.py
-Complete animation engine for Soumo Screen Recorder PRO.
-Provides smooth 60fps property animations via Tkinter .after() loops.
-Includes spring physics, pulse loops, and color interpolation.
+Key-based animation engine for Soumo Screen Recorder PRO.
+Uses time.perf_counter for precise timing. Each animation is
+identified by a unique string key so it can be cancelled by name.
 """
 from __future__ import annotations
 import math
+import time
 import logging
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
 
 log = logging.getLogger(__name__)
 
-FRAME_MS = 16  # ~60 FPS
-
-
-# ────────────────────────────────────────────────────────────────
-class EasingFunctions:
-    """
-    Collection of easing functions. All take t in [0.0, 1.0]
-    and return an eased value, usually also in [0.0, 1.0].
-    """
-
-    @staticmethod
-    def linear(t: float) -> float:
-        return t
-
-    @staticmethod
-    def ease_out_cubic(t: float) -> float:
-        """Decelerating. Starts fast, ends slow."""
-        return 1 - (1 - t) ** 3
-
-    @staticmethod
-    def ease_in_cubic(t: float) -> float:
-        """Accelerating. Starts slow, ends fast."""
-        return t ** 3
-
-    @staticmethod
-    def ease_in_out_sine(t: float) -> float:
-        """Smooth S-curve using sine wave."""
-        return -(math.cos(math.pi * t) - 1) / 2
-
-    @staticmethod
-    def ease_out_back(t: float) -> float:
-        """Slight overshoot and settle. Good for UI popins."""
-        c1 = 1.70158
-        c3 = c1 + 1
-        return 1 + c3 * (t - 1) ** 3 + c1 * (t - 1) ** 2
-
-    @staticmethod
-    def spring(t: float, stiffness: float = 200.0, damping: float = 20.0) -> float:
-        """
-        Physical spring simulation with overshoot.
-
-        Args:
-            t:          Time in [0.0, 1.0] (normalized to animation duration)
-            stiffness:  Spring stiffness constant (higher = stiffer)
-            damping:    Damping coefficient (higher = less oscillation)
-
-        Returns:
-            Displacement value (may exceed 1.0 on overshoot)
-        """
-        if t <= 0.0:
-            return 0.0
-        if t >= 1.0:
-            return 1.0
-
-        omega = math.sqrt(stiffness)
-        zeta  = damping / (2.0 * omega)
-
-        if zeta < 1.0:
-            wd = omega * math.sqrt(1.0 - zeta ** 2)
-            return 1.0 - math.exp(-zeta * omega * t) * (
-                math.cos(wd * t) + (zeta * omega / wd) * math.sin(wd * t)
-            )
-        else:
-            return 1.0 - math.exp(-omega * t) * (1.0 + omega * t)
-
-
-# Convenient module-level aliases
-ease_out_cubic   = EasingFunctions.ease_out_cubic
-ease_in_out_sine = EasingFunctions.ease_in_out_sine
-ease_out_back    = EasingFunctions.ease_out_back
-spring           = EasingFunctions.spring
-
 
 # ── Color helpers ─────────────────────────────────────────────────────────────
-def hex_to_rgb(hex_color: str) -> tuple:
-    """Convert hex color string to (r, g, b) int tuple."""
-    h = hex_color.lstrip("#")
-    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
 
-
-def rgb_to_hex(r: float, g: float, b: float) -> str:
-    """Convert (r, g, b) floats to hex color string."""
-    return f"#{int(max(0,min(255,r))):02x}{int(max(0,min(255,g))):02x}{int(max(0,min(255,b))):02x}"
-
-
-def lerp_color(a: str, b: str, t: float) -> str:
-    """
-    Linear interpolate between two hex colors.
-
-    Args:
-        a: Start hex color.
-        b: End hex color.
-        t: Factor in [0.0, 1.0].
-
-    Returns:
-        Interpolated hex color string.
-    """
-    ra, ga, ba = hex_to_rgb(a)
-    rb, gb, bb = hex_to_rgb(b)
-    return rgb_to_hex(ra + (rb - ra) * t, ga + (gb - ga) * t, ba + (bb - ba) * t)
+def interpolate_color(hex1: str, hex2: str, t: float) -> str:
+    """Interpolate between two hex colors. t in [0.0, 1.0]."""
+    t = max(0.0, min(1.0, t))
+    def _parse(h: str):
+        h = h.lstrip("#")
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    r1, g1, b1 = _parse(hex1)
+    r2, g2, b2 = _parse(hex2)
+    r = int(r1 + (r2 - r1) * t)
+    g = int(g1 + (g2 - g1) * t)
+    b = int(b1 + (b2 - b1) * t)
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 def lerp(a: float, b: float, t: float) -> float:
-    """Linear interpolation."""
     return a + (b - a) * t
 
 
-# ── Animator ────────────────────────────────────────────────────────────────
+# ── Easing functions ──────────────────────────────────────────────────────────
+
+def _ease_out_cubic(t: float) -> float:
+    return 1 - (1 - t) ** 3
+
+def _ease_in_out_sine(t: float) -> float:
+    return -(math.cos(math.pi * t) - 1) / 2
+
+def _spring(t: float) -> float:
+    """Spring approximation with slight overshoot."""
+    if t >= 1.0:
+        return 1.0
+    v = 1 - math.exp(-6 * t) * math.cos(12 * t)
+    return min(v, 1.05)  # allow tiny overshoot
+
+
+_EASINGS: Dict[str, Callable[[float], float]] = {
+    "linear":           lambda t: t,
+    "ease_out_cubic":   _ease_out_cubic,
+    "ease_in_out_sine": _ease_in_out_sine,
+    "spring":           _spring,
+}
+
+# Public aliases — imported by countdown.py and other modules
+ease_out_cubic   = _ease_out_cubic
+ease_in_out_sine = _ease_in_out_sine
+spring_ease      = _spring
+
+
+def lerp_color(a: str, b: str, t: float) -> str:
+    """Alias for interpolate_color (backwards compatibility)."""
+    return interpolate_color(a, b, t)
+
+
+# ── Animator ──────────────────────────────────────────────────────────────────
+
 class Animator:
     """
-    Generic property animator using Tkinter's .after() scheduler.
+    Key-based animation manager for Tkinter.
 
-    Drives a transition from 0.0 to 1.0 (normalized time) over
-    `duration_ms` milliseconds, calling `on_update(t)` each frame
-    where t is the eased value at that moment.
+    Each animation is keyed by a string. Starting a new animation
+    with the same key automatically cancels the previous one.
 
-    Args:
-        root:        Any Tkinter widget (used for .after() scheduling).
-        duration_ms: Total animation length in milliseconds.
-        on_update:   Called each frame with eased t in [0.0, ~1.05].
-        on_complete: Optional callback when animation ends.
-        easing:      Easing function. Defaults to ease_out_cubic.
+    Uses time.perf_counter() for sub-millisecond precision.
+    All callbacks are scheduled via root.after() so they execute
+    safely on the main Tkinter thread.
+
+    Usage:
+        anim = Animator(root)
+        anim.animate("btn_hover", 0, 1, 120, "ease_out_cubic",
+                     on_update=lambda v: update_color(v))
+        anim.pulse("rec_pulse", on_update=lambda v: set_glow(v),
+                   min_val=0.3, max_val=1.0, period_ms=1800)
+        anim.stop("rec_pulse")
+        anim.stop_all()
     """
 
-    def __init__(
+    def __init__(self, root):
+        self.root = root
+        self._active: Dict[str, str] = {}  # key -> after_id
+
+    def animate(
         self,
-        root,
+        key:         str,
+        start:       float,
+        end:         float,
         duration_ms: int,
-        on_update:   Callable[[float], None],
-        on_complete: Optional[Callable] = None,
-        easing:      Callable[[float], float] = None,
-    ):
-        self._root       = root
-        self._duration   = max(1, duration_ms)
-        self._on_update  = on_update
-        self._on_complete = on_complete
-        self._easing     = easing or ease_out_cubic
-        self._elapsed    = 0
-        self._after_id   = None
-        self._running    = False
+        easing:      str = "ease_out_cubic",
+        on_update:   Optional[Callable[[float], None]] = None,
+        on_done:     Optional[Callable] = None,
+    ) -> None:
+        """
+        Animate a float value from start to end over duration_ms.
 
-    def start(self) -> "Animator":
-        """Start the animation. Returns self for chaining."""
-        self.stop()
-        self._elapsed = 0
-        self._running = True
-        self._tick()
-        return self
+        Args:
+            key:         Unique identifier. Cancels any existing animation with same key.
+            start:       Starting value.
+            end:         Target value.
+            duration_ms: Duration in milliseconds.
+            easing:      Easing function name (see _EASINGS).
+            on_update:   Called each frame with current interpolated value.
+            on_done:     Called once when animation completes.
+        """
+        self.stop(key)
+        easing_fn = _EASINGS.get(easing, _ease_out_cubic)
+        start_t   = time.perf_counter()
+        dur_s     = max(duration_ms, 1) / 1000.0
 
-    def stop(self) -> None:
-        """Cancel the animation immediately."""
-        self._running = False
-        if self._after_id is not None:
-            try:
-                self._root.after_cancel(self._after_id)
-            except Exception:
-                pass
-            self._after_id = None
+        def _tick():
+            if key not in self._active:
+                return
+            elapsed = time.perf_counter() - start_t
+            raw_t   = min(elapsed / dur_s, 1.0)
+            value   = start + (end - start) * easing_fn(raw_t)
 
-    def _tick(self) -> None:
-        if not self._running:
-            return
-        raw_t = min(self._elapsed / self._duration, 1.0)
-        eased = self._easing(raw_t)
-        try:
-            self._on_update(eased)
-        except Exception as e:
-            log.debug("Animator update error: %s", e)
-            self.stop()
-            return
-
-        if raw_t >= 1.0:
-            self._running = False
-            if self._on_complete:
+            if on_update:
                 try:
-                    self._on_complete()
+                    on_update(value)
                 except Exception as e:
-                    log.debug("Animator complete error: %s", e)
-            return
+                    log.debug("Animator[%s] update error: %s", key, e)
 
-        self._elapsed += FRAME_MS
-        self._after_id = self._root.after(FRAME_MS, self._tick)
+            if raw_t >= 1.0:
+                self._active.pop(key, None)
+                if on_update:
+                    try:
+                        on_update(end)
+                    except Exception:
+                        pass
+                if on_done:
+                    try:
+                        on_done()
+                    except Exception as e:
+                        log.debug("Animator[%s] done error: %s", key, e)
+            else:
+                self._active[key] = self.root.after(16, _tick)
 
+        self._active[key] = self.root.after(0, _tick)
 
-# ── ColorAnimator ───────────────────────────────────────────────────────────
-class ColorAnimator:
-    """
-    Smoothly interpolates between two hex colors.
+    def pulse(
+        self,
+        key:        str,
+        on_update:  Callable[[float], None],
+        min_val:    float = 0.0,
+        max_val:    float = 1.0,
+        period_ms:  int   = 1800,
+    ) -> None:
+        """
+        Run a continuous sine-wave pulse between min_val and max_val.
+        Runs until stop(key) is called.
 
-    Args:
-        root:        Tkinter widget for scheduling.
-        from_color:  Starting hex color.
-        to_color:    Ending hex color.
-        duration_ms: Duration in milliseconds.
-        setter:      Callable receiving the current hex color string each frame.
-        easing:      Optional easing function.
-        on_complete: Optional completion callback.
-    """
+        Args:
+            key:        Unique animation key.
+            on_update:  Called ~60fps with current value in [min_val, max_val].
+            min_val:    Minimum oscillation value.
+            max_val:    Maximum oscillation value.
+            period_ms:  Full oscillation cycle duration in milliseconds.
+        """
+        self.stop(key)
+        start_t = time.perf_counter()
 
-    def __init__(self, root, from_color: str, to_color: str,
-                 duration_ms: int, setter: Callable[[str], None],
-                 easing=None, on_complete=None):
-        self._from  = from_color
-        self._to    = to_color
-        self._setter = setter
-        self._anim   = Animator(
-            root, duration_ms,
-            on_update=self._update,
-            on_complete=on_complete,
-            easing=easing
-        )
-
-    def _update(self, t: float) -> None:
-        self._setter(lerp_color(self._from, self._to, t))
-
-    def start(self) -> "ColorAnimator":
-        """Start the color animation."""
-        self._anim.start()
-        return self
-
-    def stop(self) -> None:
-        """Stop the color animation."""
-        self._anim.stop()
-
-
-# ── PulseLoop ────────────────────────────────────────────────────────────────
-class PulseLoop:
-    """
-    Continuous sinusoidal breathing/pulsing animation.
-
-    Calls on_update with a value in [0.0, 1.0] cycling on a sine wave.
-    Runs indefinitely until stop() is called.
-
-    Args:
-        root:       Tkinter widget for scheduling.
-        period_ms:  Full cycle duration (peak to peak) in milliseconds.
-        on_update:  Callback receiving current value in [0.0, 1.0].
-    """
-
-    def __init__(self, root, period_ms: int, on_update: Callable[[float], None]):
-        self._root      = root
-        self._period    = period_ms
-        self._on_update = on_update
-        self._elapsed   = 0
-        self._running   = False
-        self._after_id  = None
-
-    def start(self) -> "PulseLoop":
-        """Start the pulse loop."""
-        self.stop()
-        self._elapsed = 0
-        self._running = True
-        self._tick()
-        return self
-
-    def stop(self) -> None:
-        """Stop the pulse loop immediately."""
-        self._running = False
-        if self._after_id is not None:
+        def _tick():
+            if key not in self._active:
+                return
+            elapsed_ms = (time.perf_counter() - start_t) * 1000
+            phase = (elapsed_ms % period_ms) / period_ms
+            sine  = math.sin(2 * math.pi * phase - math.pi / 2)
+            val   = min_val + (max_val - min_val) * (sine * 0.5 + 0.5)
             try:
-                self._root.after_cancel(self._after_id)
+                on_update(val)
+            except Exception:
+                self.stop(key)
+                return
+            self._active[key] = self.root.after(16, _tick)
+
+        self._active[key] = self.root.after(16, _tick)
+
+    def stop(self, key: str) -> None:
+        """Cancel animation by key."""
+        after_id = self._active.pop(key, None)
+        if after_id:
+            try:
+                self.root.after_cancel(after_id)
             except Exception:
                 pass
-            self._after_id = None
 
-    def _tick(self) -> None:
-        if not self._running:
-            return
-        phase = (self._elapsed % self._period) / self._period
-        value = (math.sin(2 * math.pi * phase - math.pi / 2) + 1) / 2
-        try:
-            self._on_update(value)
-        except Exception:
-            self.stop()
-            return
-        self._elapsed += FRAME_MS
-        self._after_id = self._root.after(FRAME_MS, self._tick)
+    def stop_all(self) -> None:
+        """Cancel all active animations."""
+        for key in list(self._active.keys()):
+            self.stop(key)
