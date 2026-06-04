@@ -1,0 +1,34 @@
+# Soumo Screen Recorder PRO — Byte-level exclusion from Windows capture
+
+# Python bytecache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Temp recording files (created during recording, deleted after mux)
+_soumo_tmp_video.*
+_soumo_tmp_audio.*
+
+# Log file (regenerated on each launch)
+soumo_sr.log
+
+# Auto-generated settings (user-specific)
+settings.json
+
+# Test recordings
+test_*.mp4
+test_*.mkv
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# Build artifacts
+dist/
+build/
+*.spec
