@@ -38,8 +38,10 @@ QUALITY_PROFILES = {
 
 COLOR_FILTERS = {
     "Neutral":   None,
-    "Vibrant":   "eq=saturation=1.3:contrast=1.05",
-    "Cinematic": "eq=contrast=1.15:gamma=0.95:saturation=0.9",
+    "Vibrant":   "eq=saturation=1.35:contrast=1.06:brightness=0.02",
+    "Cinematic": "eq=contrast=1.18:gamma=0.92:saturation=0.82",
+    "Warm":      "eq=saturation=1.1:contrast=1.05",
+    "Cool":      "eq=saturation=0.95:contrast=1.08",
 }
 
 
@@ -111,12 +113,16 @@ class ScreenRecorder:
 
     def __init__(self):
         self.is_recording: bool = False
+        self.is_paused:    bool = False
         self.output_file: str = ""
 
         self._stop_event   = threading.Event()
+        self._pause_event  = threading.Event()  # set = paused
         self._timer_stop   = threading.Event()
         self._timer_cb: Optional[Callable[[str], None]] = None
         self._start_time: float = 0.0
+        self._paused_elapsed: float = 0.0  # accumulated paused time
+        self._pause_start: float = 0.0
 
         self._camera: Optional[dxcam.DXCamera] = None
         self._ffmpeg: Optional[subprocess.Popen] = None
@@ -129,6 +135,7 @@ class ScreenRecorder:
         self._audio_info:   dict = {}
         self._temp_video: str = ""
         self._temp_audio: str = ""
+        self._last_frame: Optional[np.ndarray] = None  # for freeze-frame during pause
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -400,8 +407,12 @@ class ScreenRecorder:
 
         # ── Start capture and audio threads ───────────────────────────────────
         self._stop_event.clear()
+        self._pause_event.clear()
         self._audio_frames = []
         self._audio_info   = {}
+        self._last_frame   = None
+        self._paused_elapsed = 0.0
+        self._fps          = fps  # store for capture loop
 
         self._camera.start(target_fps=fps, video_mode=True)
         log.info("dxcam camera started in video_mode")
@@ -425,7 +436,26 @@ class ScreenRecorder:
         self._timer_thread.start()
 
         self.is_recording = True
+        self.is_paused    = False
         log.info("Recording is live.")
+
+    def pause_recording(self) -> None:
+        """Pause recording — freezes last frame into FFmpeg, pauses timer."""
+        if not self.is_recording or self.is_paused:
+            return
+        self.is_paused   = True
+        self._pause_start = time.time()
+        self._pause_event.set()
+        log.info("Recording paused")
+
+    def resume_recording(self) -> None:
+        """Resume paused recording."""
+        if not self.is_recording or not self.is_paused:
+            return
+        self._paused_elapsed += time.time() - self._pause_start
+        self.is_paused = False
+        self._pause_event.clear()
+        log.info("Recording resumed (total paused: %.1fs)", self._paused_elapsed)
 
     def stop_recording(self) -> None:
         """
@@ -435,6 +465,9 @@ class ScreenRecorder:
         if not self.is_recording:
             log.warning("stop_recording called while not recording")
             return
+        # Ensure we unpause before stopping
+        if self.is_paused:
+            self.resume_recording()
 
         log.info("=== STOP RECORDING ===")
         self.is_recording = False
@@ -513,11 +546,26 @@ class ScreenRecorder:
 
     def _capture_loop(self) -> None:
         """Grab BGR frames from dxcam, crop if needed, write raw bytes to FFmpeg."""
-        frame_count = 0
-        error_count = 0
-        log.info("Capture loop started")
+        frame_count  = 0
+        error_count  = 0
+        MAX_ERRORS   = 10
+        frame_interval = 1.0 / max(self._fps, 1)
+        log.info("Capture loop started (target fps=%d)", self._fps)
 
         while not self._stop_event.is_set():
+
+            # ── Pause handling ─────────────────────────────────────────────────
+            if self._pause_event.is_set():
+                # Write frozen last frame to keep FFmpeg's timeline consistent
+                if self._last_frame is not None and self._ffmpeg and self._ffmpeg.stdin:
+                    try:
+                        self._ffmpeg.stdin.write(self._last_frame.tobytes())
+                        frame_count += 1
+                    except Exception:
+                        pass
+                time.sleep(frame_interval)
+                continue
+
             frame = self._camera.get_latest_frame()
 
             if frame is None:
@@ -535,6 +583,9 @@ class ScreenRecorder:
                 l, t, r, b = self._crop_region
                 frame = frame[t:b, l:r]
 
+            # Keep copy for pause freeze-frame
+            self._last_frame = frame
+
             # Write raw BGR bytes to FFmpeg stdin
             if self._ffmpeg and self._ffmpeg.stdin:
                 try:
@@ -547,7 +598,7 @@ class ScreenRecorder:
                     error_count += 1
                     log.error("Frame write error (frame %d, error %d): %s",
                               frame_count, error_count, e)
-                    if error_count > 10:
+                    if error_count > MAX_ERRORS:
                         log.error("Too many write errors, stopping capture")
                         break
             else:
@@ -622,13 +673,14 @@ class ScreenRecorder:
             log.exception("Audio loop error: %s", e)
 
     def _timer_loop(self) -> None:
-        """Emit elapsed time string every second via the registered callback."""
+        """Emit elapsed time string every second. Pauses when recording is paused."""
         while not self._timer_stop.is_set():
-            elapsed = int(time.time() - self._start_time)
-            h, rem = divmod(elapsed, 3600)
-            m, s   = divmod(rem, 60)
-            if self._timer_cb:
-                self._timer_cb(f"{h:02d}:{m:02d}:{s:02d}")
+            if not self.is_paused:
+                elapsed = int(time.time() - self._start_time - self._paused_elapsed)
+                h, rem = divmod(elapsed, 3600)
+                m, s   = divmod(rem, 60)
+                if self._timer_cb:
+                    self._timer_cb(f"{h:02d}:{m:02d}:{s:02d}")
             time.sleep(1)
 
     def _write_audio_wav(self) -> bool:

@@ -1,4 +1,1 @@
-"""
-ui/__init__.py
-UI package for Soumo Screen Recorder.
-"""
+"""UI package for Soumo Screen Recorder PRO."""
