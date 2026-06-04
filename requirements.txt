@@ -1,0 +1,8 @@
+customtkinter==5.2.2
+dxcam==0.0.5
+numpy
+pyaudiowpatch
+ffmpeg-python
+pillow
+keyboard
+pywin32
