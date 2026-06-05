@@ -432,9 +432,9 @@ class Toolbar(tk.Tk):
         # Main surface
         _fill_pill(cvs, 0, 0, W, H, C["bg_surface"], tags="bg")
         # Top rim light (simulates glass catching top light)
-        cvs.create_line(R, 1, W-R, 1, fill="#FFFFFF0F", width=1)
+        cvs.create_line(R, 1, W-R, 1, fill="#1B1B26", width=1)
         # Bottom rim dark
-        cvs.create_line(R, H-1, W-R, H-1, fill="#00000055", width=1)
+        cvs.create_line(R, H-1, W-R, H-1, fill="#080810", width=1)
         # Outer border
         _outline_pill(cvs, 0, 0, W, H, C["border_subtle"], width=1)
 
