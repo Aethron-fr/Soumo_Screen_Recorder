@@ -25,7 +25,10 @@ def create_shortcut():
     
     target_dir = os.path.dirname(os.path.abspath(__file__))
     target_path = os.path.join(target_dir, "run.bat")
-    icon_path = os.path.join(target_dir, "icon.ico")
+    
+    assets_dir = os.path.join(target_dir, "assets")
+    os.makedirs(assets_dir, exist_ok=True)
+    icon_path = os.path.join(assets_dir, "icon.ico")
     
     if not os.path.exists(icon_path):
         create_icon(icon_path)
